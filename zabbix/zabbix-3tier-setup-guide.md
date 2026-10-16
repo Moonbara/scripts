@@ -36,10 +36,12 @@ Fill these in for your environment, then swap them into the commands below.
 The server side of this guide (Parts 1 and 2) is automated by [`zabbix-setup.sh`](zabbix-setup.sh). Part 3 (Windows) stays manual: the script ends by printing the exact values to use. Start it in one line on each Ubuntu server:
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Moonbara/scripts/main/zabbix/zabbix-setup.sh)"
-# with options: put them after a "_" placeholder (it becomes $0)
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Moonbara/scripts/main/zabbix/zabbix-setup.sh)" _ --mode db
+sudo bash -c 'bash <(curl -fsSL https://raw.githubusercontent.com/Moonbara/scripts/main/zabbix/zabbix-setup.sh) "$@"' _
+# with options: put them after the "_" placeholder (it becomes $0)
+sudo bash -c 'bash <(curl -fsSL https://raw.githubusercontent.com/Moonbara/scripts/main/zabbix/zabbix-setup.sh) "$@"' _ --mode db
 ```
+
+- **Not `bash -c "$(curl ...)"`.** That older form passes the whole script as one argument, and Linux refuses arguments over 128 KiB. The script is bigger than that, so the run stops with "Argument list too long".
 
 - **Pin a version.** Replace `main` in the URL with a tag or a commit hash, for example `zabbix-v1.1.1`, so the code you run cannot change underneath you.
 - **This means trusting the repository.** Piping a script from the internet into a root shell runs whatever that URL serves at that moment. Read it first, or download it and run the local copy:
@@ -320,6 +322,17 @@ Check **Monitoring → Latest data** filtered to `<WIN_HOSTNAME>` — CPU, memor
 
 - **`--dry-run`** prints every command and file edit, numbered like this guide, and changes nothing. No password is needed. The list is also saved to `zabbix-manual-steps.txt`, a ready-made revision sheet for the scenario you picked.
 - **`--verify`** re-checks a server at any time: a PASS / WARN / FAIL table, each FAIL with a one-line fix.
+- **Output of a real run:** one line per step, with this guide's step number. A green `[✓]` and the duration replace the running `[✗]` and spinner once the step is done; `[-]` marks a step with nothing to do:
+
+  ```text
+  ( 7/19) [✓] 1.4 Create the database and user (CREATE USER before GRANT - MySQL 8) (0s)
+  ( 8/19) [✓] 1.5 Verify the zabbix user can log in (local socket) (0s)
+  ( 9/19) [✗] 2.1 Add the Zabbix 8.0 repository (Ubuntu 26.04)... ⠸
+  ```
+
+  - **Full output:** the commands' output (apt, mysql, systemctl…) goes to `/var/log/zabbix-setup.log`, never with the password. A failed step stays red, with its last 15 lines, the error, the fix from the Troubleshooting table above, and the log path.
+  - **`--verbose` / `-v`** (or `ZBX_VERBOSE=1`): every command as `$ ...`, with its live output underneath.
+  - **Piped output:** plain `[..]` / `[OK]` / `[FAIL]` lines. `NO_COLOR=1` / `TERM=dumb` turn off colours and the redraw.
 - **`--env-file PATH`** loads `ZBX_*` settings from a file (`ZBX_DB_IP=...`, `ZBX_DB_PORT=...`, `ZBX_DB_PASSWORD='...'`). The DB server's `zabbix-handoff.txt` is such a file: copy it to the app server with `scp` and pass it with `--env-file`. Each run also writes `./zabbix-setup.env` (chmod 600) and reads it back automatically on the next run in the same directory. Priority: flag > `ZBX_*` environment variable > env file > prompt.
 - The env file, `zabbix-handoff.txt` and `zabbix-next-steps.txt` contain the DB password: keep them chmod 600 and out of git.
 - Single VM with a custom MySQL port (`--db-port`): Zabbix then connects over TCP to `127.0.0.1:<port>`, and the wizard's Database host is `127.0.0.1`. `localhost` would make the MySQL client use the socket and ignore the port.

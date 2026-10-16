@@ -1,6 +1,6 @@
 # zabbix-setup.sh: how to use it
 
-Step-by-step usage of [`zabbix-setup.sh`](zabbix-setup.sh) version 1.2.0: Zabbix 8.0 LTS server side on Ubuntu 26.04. The manual procedure it automates is in [`zabbix-3tier-setup-guide.md`](zabbix-3tier-setup-guide.md).
+Step-by-step usage of [`zabbix-setup.sh`](zabbix-setup.sh) version 1.3.0: Zabbix 8.0 LTS server side on Ubuntu 26.04. The manual procedure it automates is in [`zabbix-3tier-setup-guide.md`](zabbix-3tier-setup-guide.md).
 
 ## Contents
 
@@ -43,7 +43,7 @@ Get the script on each server: either run it in one line (the commands below use
 
 ```bash
 # one line
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Moonbara/scripts/main/zabbix/zabbix-setup.sh)" _ --mode single
+sudo bash -c 'bash <(curl -fsSL https://raw.githubusercontent.com/Moonbara/scripts/main/zabbix/zabbix-setup.sh) "$@"' _ --mode single
 
 # or download, read, run
 curl -fsSLO https://raw.githubusercontent.com/Moonbara/scripts/main/zabbix/zabbix-setup.sh
@@ -52,7 +52,7 @@ chmod +x zabbix-setup.sh
 sudo ./zabbix-setup.sh --mode single
 ```
 
-Read the script before you run it as root. To pin a version, replace `main` in the URL with a tag or a commit hash, for example `.../Moonbara/scripts/zabbix-v1.1.1/zabbix/zabbix-setup.sh`. The rest of this page uses `sudo ./zabbix-setup.sh`.
+Do not use the older `sudo bash -c "$(curl -fsSL URL)"` form: since version 1.2.0 the script is over 128 KiB, the most Linux accepts as a single argument, so it fails with "Argument list too long". Read the script before you run it as root. To pin a version, replace `main` in the URL with a tag or a commit hash, for example `.../Moonbara/scripts/zabbix-v1.1.1/zabbix/zabbix-setup.sh`. The rest of this page uses `sudo ./zabbix-setup.sh`.
 
 **Run it from the directory where you want the output files.** The hand-off, env file and next-steps file are written to the current directory.
 
@@ -64,6 +64,25 @@ Read the script before you run it as root. To pin a version, replace `main` in t
 - Text you type in an input box is **added to** the pre-filled default, so press Backspace first if you want to replace it.
 
 Add `--no-dialog` for plain text prompts.
+
+**Output.** Once the questions are answered, each step is **one line**, numbered like the guide, with a counter:
+
+- While it runs: `[✗]` (not finished yet), the title, and a spinner.
+- When it ends: green `[✓]` and the duration, or yellow `[-]` with the reason when there was nothing to do.
+
+```text
+( 9/19) [✓] 2.1 Add the Zabbix 8.0 repository (Ubuntu 26.04) (20s)
+(10/19) [✓] 2.2 Install Zabbix packages (agent 2, not the classic agent) (31s)
+(11/19) [✗] 2.3 Import the schema... ⠼          <- running
+```
+
+- **The full output** (apt, mysql, systemctl, netplan…) goes to `/var/log/zabbix-setup.log` only, with timestamps and never the password. To watch it live, run `sudo tail -f /var/log/zabbix-setup.log` in a second terminal: a step's output is added when the step ends. Warnings stay visible on screen, under their step.
+- **A failed step** stays a red `[✗]`, followed by its last 15 lines of output, the error and its fix (the guide's troubleshooting hint), and the log path. Fix the cause and run the script again.
+- **A question inside a step** (a static IP to apply, `--add-user`, `passwd`, `netplan try`): the spinner stops, the step's output so far is printed for context, then the question. The step line comes back after your answer.
+- **At the end:** the list of all steps with the total time, then the verification table and the NEXT STEPS block.
+- **`--verbose` / `-v`** (or `ZBX_VERBOSE=1`, e.g. `sudo --preserve-env=ZBX_VERBOSE ...`): no spinner. Each step's title, then every command as `$ ...` with its live output indented underneath, then the `[✓]` line. The password and the MySQL option file are never shown.
+- **Not a terminal** (piped to a file, cron, CI): plain `[..] step` / `[OK] step (14s)` / `[SKIP]` / `[FAIL]` lines, no escape codes. `NO_COLOR=1` or `TERM=dumb`: no colours and no redraw. A non-UTF-8 locale: `[ ]` running, `[v]` done, `[x]` failed.
+- **`--dry-run` and `--verify`** print exactly as before.
 
 ---
 
@@ -99,9 +118,8 @@ The script asks, in this order:
 
 What you should see next:
 
-- A preflight table: OS, disk, RAM, the repository, ports.
-- The guide's steps running in order: `Step 0.4`, `Step 1.1` … `Step 2.7a`.
-- A verification table.
+- One line per step, in the guide's order: `0.1` (preflight: OS, disk, RAM, the repository, ports), `0.3`, `0.4`, `1.1` … `2.9`. See [Output](#1-before-you-start).
+- The list of steps with the total time, then a verification table.
 - A **NEXT STEPS** block with the web wizard values and the password. The password is shown once and saved to `zabbix-next-steps.txt`.
 
 Check it worked, now or any time later:
@@ -178,10 +196,11 @@ sudo ./zabbix-setup.sh --mode app --env-file ./zabbix-handoff.txt
 - It still asks the static IP question, whether to install Agent 2 on this server, the optional Windows fields and the summary.
 - It tests the TCP port and the MySQL login, imports the schema (1–2 minutes), configures zabbix-server, Apache, PHP and the locale, then starts the services.
 
-At the end you usually see this, followed by the NEXT STEPS block:
+Under step 2.3 you usually see this warning, and the NEXT STEPS block at the end:
 
 ```text
-WARNING: ACTION ON THE DB SERVER (<DB_IP>): the zabbix account may not change global settings. Run there:
+( 6/14) [✓] 2.3 Import the schema into the remote DB node <DB_IP>:<DB_PORT> (39s)
+      WARNING: ACTION ON THE DB SERVER (<DB_IP>): the zabbix account may not change global settings. Run there:
 ```
 
 That NEXT STEPS block starts with step **0**, which is step 4 below.
@@ -194,13 +213,13 @@ Run it in the same directory as step 1:
 sudo ./zabbix-setup.sh --mode db --yes
 ```
 
-It reloads its own `./zabbix-setup.env`, sees the imported schema and prints:
+It reloads its own `./zabbix-setup.env`, sees the imported schema and sets the flag back to 0. Steps with nothing to do show as `[-] ... (skipped: ...)`. The log (or `--verbose`) has the line:
 
 ```text
 OK: schema already imported - log_bin_trust_function_creators is back to 0 (guide Part 2 step 3)
 ```
 
-The schema and trust-flag warnings from step 1 are gone now. Delete `zabbix-handoff.txt` on both servers once you are done.
+The schema and trust-flag warnings from step 1 are gone now: the verification ends with `Result: all checks passed (0 WARN)`. Delete `zabbix-handoff.txt` on both servers once you are done.
 
 In the web wizard on `http://<APP_IP>/zabbix`, the Database host is `<DB_IP>`, and the port must be typed as `<DB_PORT>`. **Do not leave it at 0.**
 
@@ -238,7 +257,7 @@ ZBX_DB_PASSWORD='<password>'
   - Lines starting with `#` and blank lines are ignored.
   - The file is **parsed, never sourced**: `$variables`, `$(commands)` and escapes are taken literally.
   - An unknown key gives a warning. A duplicated key, a malformed line or an invalid value stops the run and names the line number.
-- **Keys:** `ZBX_MODE`, `ZBX_APP_IP`, `ZBX_DB_IP`, `ZBX_DB_PORT`, `ZBX_DB_NAME`, `ZBX_DB_USER`, `ZBX_DB_PASSWORD`, `ZBX_TIMEZONE`, `ZBX_WIN_HOSTNAME`, `ZBX_WIN_IP`, `ZBX_IFACE`, `ZBX_STATIC_IP`, `ZBX_PREFIX`, `ZBX_GATEWAY`, `ZBX_DNS`, `ZBX_SSH_KEY_FILE`, `ZBX_INSTALL_AGENT` (`yes` or `no`), `ZBX_AGENT_HOSTNAME`.
+- **Keys:** `ZBX_MODE`, `ZBX_APP_IP`, `ZBX_DB_IP`, `ZBX_DB_PORT`, `ZBX_DB_NAME`, `ZBX_DB_USER`, `ZBX_DB_PASSWORD`, `ZBX_TIMEZONE`, `ZBX_WIN_HOSTNAME`, `ZBX_WIN_IP`, `ZBX_IFACE`, `ZBX_STATIC_IP`, `ZBX_PREFIX`, `ZBX_GATEWAY`, `ZBX_DNS`, `ZBX_SSH_KEY_FILE`, `ZBX_INSTALL_AGENT` (`yes` or `no`), `ZBX_AGENT_HOSTNAME`, `ZBX_VERBOSE` (`1` or `0`). `ZBX_VERBOSE` is a display choice: it is accepted but never written to the generated `zabbix-setup.env`.
 - **Priority:** flag > `ZBX_*` environment variable > env file > prompt.
 - **Loading:** `--env-file PATH`. Without that flag, `./zabbix-setup.env` is loaded automatically if it exists, and the script says so.
 - **Writing:** every real run (not `--dry-run`) writes `./zabbix-setup.env` with the settings it used, and keeps the previous copy as `zabbix-setup.env.bak`. Add `--no-env-password` to leave the password out.
@@ -370,6 +389,8 @@ The NEXT STEPS block (also in `zabbix-next-steps.txt`) has these steps with your
 | Database server host: agent unavailable | `Hostname=` differs from the host name in the UI, `ufw` blocks 10050, or `Server=` is not `<APP_IP>` | `sudo ./zabbix-setup.sh --verify` on the DB server checks all three. The UI host name must equal `Hostname=` exactly |
 | Built-in "Zabbix server" host: agent unavailable | Installed with `--no-agent` / answered no: there is no agent on the server | Expected. Disable the host (*Data collection > Hosts*), ignore it, or re-run with `--agent` |
 | Wizard: `Locale for language "en_US" is not found` | Locale missing, or PHP-FPM not restarted | `sudo locale-gen en_US.UTF-8 && sudo systemctl restart php8.5-fpm` |
+| The one-liner stops at once: `bash: Argument list too long` | The old `sudo bash -c "$(curl ...)"` form: the script is over Linux's 128 KiB limit for one argument | Use `sudo bash -c 'bash <(curl -fsSL <URL>) "$@"' _ [options]`, or download the file and run it |
+| A step shows a red `[✗]` and only its last lines | The full output is in the log | `sudo less /var/log/zabbix-setup.log` (search for `[FAIL]`), or re-run with `--verbose` to watch every command |
 | Password rejected: `no space at the start or end` | Leading or trailing space (Zabbix trims it in `zabbix_server.conf`) | Remove it; spaces inside are fine |
 | Password rejected: `control characters (tab, newline...) are not supported` / `at least 8 characters` | Tab, other control character, or too short | 8–128 printable characters; anything else, including `' " $ # \ & !`, works |
 
@@ -379,7 +400,8 @@ The NEXT STEPS block (also in `zabbix-next-steps.txt`) has these steps with your
 
 | File | Where | Password? |
 |---|---|---|
-| Log | `/var/log/zabbix-setup.log` (mode 600) | No (masked) |
+| Log (every command's output, `[OK]`/`[SKIP]`/`[FAIL]` line per step) | `/var/log/zabbix-setup.log` (mode 600) | No (masked) |
+| Current step's output, until it is added to the log | a `mktemp` file in `/tmp` (600), removed on exit | No (masked) |
 | Backups of every edited config | `/var/backups/zabbix-setup/<timestamp>/` (folder 700, files 600) | Yes for the copy of `zabbix_server.conf` |
 | State (role and non-secret settings, read by `--verify`) | `/etc/zabbix-setup.state` (600) | No |
 | Zabbix server config (`DBPassword=`) | `/etc/zabbix/zabbix_server.conf` | Yes (package's own permissions) |

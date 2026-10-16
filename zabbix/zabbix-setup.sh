@@ -4,7 +4,7 @@
 #  Zabbix 8.0 LTS | Ubuntu 26.04 | MySQL 8 | Apache + PHP 8.5-FPM | Agent 2
 # -----------------------------------------------------------------------------
 #  Copy this same file to every server and run it there with sudo, or start
-#  it in one line:  sudo bash -c "$(curl -fsSL <SCRIPT_URL>)" _ [options]
+#  it in one line:  sudo bash -c 'bash <(curl -fsSL <SCRIPT_URL>) "$@"' _ [options]
 #
 #    menu 1 / --mode single   Zabbix + MySQL on this VM          (Part 1 + 2)
 #    menu 2 / --mode db       two VMs: this is the DATABASE node (Part 1) FIRST
@@ -16,6 +16,12 @@
 #
 #  Part 3 (the Windows 11 agent) is NOT automated. The run ends with a
 #  NEXT STEPS block holding the exact values to type on Windows and in the UI.
+#
+#  Output: one line per step, redrawn in place ([✗] while it runs, [✓] when
+#  done, [-] when skipped). --verbose (-v, ZBX_VERBOSE=1) shows every command
+#  ($ ...) and its live output instead. Piped / non-terminal output gets plain
+#  [..] / [OK] / [FAIL] lines. The full output always goes to the log
+#  (/var/log/zabbix-setup.log), never with the password.
 #
 #  Step numbers printed by the script (and by --dry-run) are the guide's
 #  Part.Step numbers, so the output doubles as a revision sheet. Work the guide
@@ -39,7 +45,7 @@ umask 022
 # =============================================================================
 # 0. Constants and defaults - the only place versions, ports and paths live
 # =============================================================================
-readonly SCRIPT_VERSION="1.2.0"
+readonly SCRIPT_VERSION="1.3.0"
 # Optional: where the script is published. Only used to print the one-line
 # launch command (leave it empty to print <URL> instead). Pin a tag or a
 # commit instead of main for anything you rely on.
@@ -98,12 +104,15 @@ readonly MANUAL_STEPS_FILE="${OUT_DIR}/zabbix-manual-steps.txt"
 readonly DEFAULT_ENV_FILE="${OUT_DIR}/zabbix-setup.env"
 
 # How to start this script again, for the messages it prints. Run from a file
-# -> ./zabbix-setup.sh; run as  bash -c "$(curl ...)"  there is no file
-# (BASH_SOURCE is empty) -> print the same one-liner. $0 is never used.
-if [[ -n ${BASH_SOURCE[0]:-} ]]; then
+# -> ./zabbix-setup.sh. Run as the one-liner  bash <(curl ...)  the "file" is
+# a pipe (/dev/fd/N), and with  bash -c "$(curl ...)"  there is none
+# (BASH_SOURCE empty) -> print the one-liner. $0 is never used.
+# (bash -c "$(curl ...)" no longer works for this script: Linux refuses a
+# single argument over 128 KiB, and the script is bigger than that.)
+if [[ -n ${BASH_SOURCE[0]:-} && ${BASH_SOURCE[0]} != /dev/fd/* && ${BASH_SOURCE[0]} != /proc/*/fd/* ]]; then
   LAUNCH="./zabbix-setup.sh"
 else
-  LAUNCH="bash -c \"\$(curl -fsSL ${SCRIPT_URL:-<URL>})\" _"
+  LAUNCH="bash -c 'bash <(curl -fsSL ${SCRIPT_URL:-<URL>}) \"\$@\"' _"
 fi
 readonly LAUNCH
 
@@ -120,7 +129,7 @@ USE_DIALOG=false; RESET_CONFIRMED=false
 #     The internal names (MODE, DB_PORT, ...) stay unprefixed.
 declare -A SRC=()
 readonly -a INPUT_VARS=(MODE APP_IP DB_IP DB_PORT DB_NAME DB_USER TIMEZONE WIN_HOSTNAME WIN_IP
-                        IFACE STATIC_IP PREFIX GATEWAY DNS SSH_KEY_FILE INSTALL_AGENT AGENT_HOSTNAME)
+                        IFACE STATIC_IP PREFIX GATEWAY DNS SSH_KEY_FILE INSTALL_AGENT AGENT_HOSTNAME VERBOSE)
 for _v in "${INPUT_VARS[@]}"; do
   _e="ZBX_${_v}"
   if [[ -n ${!_e:-} ]]; then printf -v "$_v" '%s' "${!_e}"; SRC[$_v]="environment ${_e}"
@@ -166,8 +175,11 @@ ST_INSTALL_AGENT=""; ST_AGENT_HOSTNAME=""
 #    Everything shown goes to the terminal and, with a timestamp, to
 #    /var/log/zabbix-setup.log. --dry-run writes to zabbix-manual-steps.txt
 #    instead. Secrets never pass through these functions unmasked.
+#    During a real run each step is shown as one line (see "Step display"
+#    below) and what it prints goes to the log only, unless --verbose.
 # =============================================================================
-if [[ -t 1 ]]; then
+# No colours when NO_COLOR is set (no-color.org), on TERM=dumb or off a terminal
+if [[ -t 1 && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then
   C_BOLD=$'\e[1m'; C_GREEN=$'\e[32m'; C_YELLOW=$'\e[33m'; C_RED=$'\e[31m'; C_CYAN=$'\e[36m'; C_OFF=$'\e[0m'
 else
   C_BOLD=""; C_GREEN=""; C_YELLOW=""; C_RED=""; C_CYAN=""; C_OFF=""
@@ -176,11 +188,39 @@ LOG_ON=false
 MANUAL_FILE=""
 TMP_PATHS=()
 
+# --- Step display state (set up by ui_init; see "Step display" below) -------
+#  UI=classic   --dry-run, --verify, --help: the numbered output as before
+#  UI=progress  terminal: one line per step, redrawn in place, with a spinner
+#  UI=plain     stdout is not a terminal: "[..] step" then "[OK] step (14s)"
+#  UI=verbose   --verbose: every command ($ ...) and its output, then the
+#               step's [✓] / [✗] / [-] line
+UI=classic
+UI_TTY=false; [[ -t 1 ]] && UI_TTY=true
+UI_REDRAW=false          # in-place line + spinner (terminal, colours allowed)
+UI_PAUSE=0               # >0 while a question or netplan try has the terminal
+INTERRUPTED=""           # INT / TERM / HUP received
+STEP_FILE=""             # progress/plain: the current step's output (mode 600)
+STEP_ON=false; STEP_NUM=""; STEP_TITLE=""; STEP_T0=0; STEP_STATUS=""; STEP_NOTE=""
+STEP_INSTALLED=false     # apt_install installed something in this step
+STEP_SHOWN=0             # bytes of STEP_FILE already shown above a question
+STEP_HEADED=false        # that question already has the step header above it
+STEP_N=0; STEP_TOTAL=0; STEP_LINES=(); RUN_T0=-1
+SPIN_PID=""; CURSOR_HIDDEN=false; FAIL_CMD=""
+M_RUN=""; M_OK=""; M_FAIL=""; M_SKIP=""; SPIN_FRAMES=()
+
 _record() {   # plain line -> log (timestamped) and/or the dry-run manual file
-  if [[ $LOG_ON == true ]]; then printf '[%(%F %T)T] %s\n' -1 "$1" >>"$LOG_FILE"; fi
+  if [[ $LOG_ON == true ]]; then
+    # inside a progress/plain step the line goes to the step file first (it is
+    # appended to the log when the step ends, so the log keeps its order)
+    if [[ $STEP_ON == true && -n $STEP_FILE ]]; then printf '[%(%F %T)T] %s\n' -1 "$1" >>"$STEP_FILE"
+    else printf '[%(%F %T)T] %s\n' -1 "$1" >>"$LOG_FILE"; fi
+  fi
   if [[ -n $MANUAL_FILE ]]; then printf '%s\n' "$1" >>"$MANUAL_FILE"; fi
 }
-_emit() { local color=$1; shift; printf '%s%s%s\n' "$color" "$*" "${color:+$C_OFF}"; _record "$*"; }
+# _screen: may a line go to the terminal now? Not inside a progress/plain
+# step (it would break the step line), except while a question is shown.
+_screen() { [[ $STEP_ON != true || -z $STEP_FILE || $UI_PAUSE -gt 0 ]]; }
+_emit() { local color=$1; shift; if _screen; then printf '%s%s%s\n' "$color" "$*" "${color:+$C_OFF}"; fi; _record "$*"; }
 say()   { _emit "" "$*"; }
 info()  { _emit "$C_CYAN" "      $*"; }
 ok()    { _emit "$C_GREEN" "      OK: $*"; }
@@ -189,14 +229,23 @@ skip()  { _emit "" "      skipped: $*"; }
 err()   { local l; for l in "$@"; do _emit "$C_RED" "ERROR: $l" >&2; done; }
 die()   { err "$@"; exit 1; }
 
-part() { say ""; _emit "$C_BOLD" "==================== $* ===================="; }
+part() { step_close; say ""; _emit "$C_BOLD" "==================== $* ===================="; }
 
-step() {      # step NUMBER TITLE - numbers follow the guide
+# step NUMBER TITLE - numbers follow the guide. In a real run this is also
+# the step wrapper: it ends the previous step (its [✓] line) and starts this
+# one (its [✗] line + spinner, output captured). See "Step display".
+step() {
   CUR_STEP=$1; ACTION_N=0
+  step_close
   local t=""
   if [[ $DRY_RUN != true ]]; then t=$(printf '   [%(%H:%M:%S)T]' -1); fi
-  say ""
-  _emit "$C_BOLD" "--- Step $1: $2$t"
+  if [[ $UI == classic || $UI == verbose ]]; then
+    say ""
+    _emit "$C_BOLD" "--- Step $1: $2$t"
+  fi
+  [[ $UI == classic ]] && return 0
+  step_begin "$1" "$2"
+  if [[ -n $STEP_FILE ]]; then _record ""; _record "--- Step $1: $2$t"; fi
 }
 
 _action() {   # numbered action line ([1.2.3]) plus optional detail lines
@@ -207,8 +256,43 @@ _action() {   # numbered action line ([1.2.3]) plus optional detail lines
   for l in "$@"; do say "          $l"; done
 }
 
-_q() { local out="" a; for a in "$@"; do out+="$(printf '%q' "$a") "; done; printf '%s' "${out% }"; }
-_logpipe() { if [[ $LOG_ON == true ]]; then tee -a "$LOG_FILE"; else cat; fi; }
+# _q ARGS... - shell-quoted command line for display. An argument holding the
+# DB password (never expected) is shown with it masked.
+_q() {
+  local out="" a q
+  for a in "$@"; do
+    if [[ -n ${DB_PASSWORD:-} && $a == *"$DB_PASSWORD"* ]]; then q=${a//"$DB_PASSWORD"/$MASK}
+    else printf -v q '%q' "$a"; fi
+    out+="${q} "
+  done
+  printf '%s' "${out% }"
+}
+# _logpipe: command output -> the log (or the current step's file); on the
+# terminal too with --verbose (indented) or outside a progress step. The DB
+# password is masked in case a command ever echoes it.
+_logpipe() {
+  if [[ $UI == classic ]]; then
+    if [[ $LOG_ON == true ]]; then tee -a "$LOG_FILE"; else cat; fi
+    return
+  fi
+  local l show=false dest=$LOG_FILE
+  if [[ $STEP_ON == true && -n $STEP_FILE ]]; then dest=$STEP_FILE; fi
+  if _screen; then show=true; fi
+  {
+    while IFS= read -r l || [[ -n $l ]]; do
+      if [[ -n $DB_PASSWORD ]]; then l=${l//"$DB_PASSWORD"/$MASK}; fi
+      printf '%s\n' "$l" >&4
+      if [[ $show == true ]]; then printf '    %s\n' "$l"; fi
+    done
+  } 4>>"$dest"
+}
+# _xcmd "TEXT" - the exact command about to run: shown with --verbose and
+# always logged (password masked; option files are named, never printed).
+_xcmd() {
+  local c=$1
+  if [[ -n $DB_PASSWORD ]]; then c=${c//"$DB_PASSWORD"/$MASK}; fi
+  _emit "" "  \$ ${c}"
+}
 
 # run CMD...                 show "$ sudo CMD" and run it (output logged)
 # run_show "TEXT" CMD...     show TEXT (the manual equivalent) and run CMD
@@ -219,13 +303,264 @@ run_show() {
   local shown=$1 rc=0; shift
   _action "\$ $shown"
   if [[ $DRY_RUN == true ]]; then return 0; fi
+  # the exact command (a helper function such as fetch_url is shown by the
+  # manual equivalent above instead)
+  if ! declare -F "$1" >/dev/null; then _xcmd "$(_q "$@")"; fi
   "$@" 2>&1 | _logpipe || rc=$?
   if ((rc != 0)); then err "command failed (exit ${rc}): ${shown}"; fi
   return "$rc"
 }
 
+# --- Step display -------------------------------------------------------------
+# One step = one line on the terminal. step() opens it; the next step(),
+# part() or step_close closes it. While it is open, fds 1 and 2 point at
+# STEP_FILE and the terminal is reached through fds 7 and 8 (saved by
+# ui_init). Questions and netplan try get the terminal back through
+# ui_pause / ui_resume, so no prompt ever appears under a spinner.
+ui_init() {      # after flags and the env file: pick the display mode
+  [[ $DRY_RUN == true || $DO_VERIFY == true ]] && return 0   # unchanged output
+  if v_verbose "$VERBOSE"; then :; else die "VERBOSE='${VERBOSE}' from ${SRC[VERBOSE]:-?} is invalid: ${VERR}"; fi
+  case ${VERBOSE,,} in 1|yes|true) UI=verbose ;; *) UI=progress ;; esac
+  if [[ $UI == progress && $UI_TTY != true ]]; then UI=plain; fi
+  if [[ $UI_TTY != true ]]; then
+    M_RUN="[..]"; M_OK="[OK]"; M_FAIL="[FAIL]"; M_SKIP="[SKIP]"
+  elif [[ $(locale charmap 2>/dev/null || true) == UTF-8 ]]; then
+    M_RUN="[✗]"; M_OK="[✓]"; M_FAIL="[✗]"; M_SKIP="[-]"; SPIN_FRAMES=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+  else
+    M_RUN="[ ]"; M_OK="[v]"; M_FAIL="[x]"; M_SKIP="[-]"; SPIN_FRAMES=('|' '/' '-' "\\")
+  fi
+  # no cursor tricks on TERM=dumb or with NO_COLOR: one line at the start, one at the end
+  if [[ $UI == progress && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then UI_REDRAW=true; fi
+  if [[ $UI != verbose ]]; then
+    STEP_FILE=$(mktemp); TMP_PATHS+=("$STEP_FILE")
+    chmod 600 "$STEP_FILE"
+  fi
+  exec 7>&1 8>&2
+  trap 'on_signal 130 INT' INT
+  trap 'on_signal 143 TERM' TERM
+  trap 'on_signal 129 HUP' HUP
+}
+ui_mode_text() {  # for the settings summary
+  case $UI in
+    verbose)  printf 'verbose - every command and its output (from %s)' "${SRC[VERBOSE]:-?}" ;;
+    progress) printf 'one line per step (--verbose shows every command)' ;;
+    plain)    printf 'plain lines (output is not a terminal)' ;;
+  esac
+}
+on_signal() { INTERRUPTED=$2; trap - INT TERM HUP; exit "$1"; }
+
+# NOW = seconds since boot (/proc/uptime): monotonic, so step 0.4 (chrony
+# stepping the clock, a new timezone) cannot distort the durations.
+NOW=0
+_now() { local u _rest; if read -r u _rest </proc/uptime 2>/dev/null; then NOW=${u%%.*}; else NOW=$SECONDS; fi; }
+_dur() { if (($1 < 60)); then printf '%ds' "$1"; else printf '%dm%02ds' $(($1 / 60)) $(($1 % 60)); fi; }
+_step_lead() {   # _step_lead MARKER -> "( 4/14) [✓] 2.3 Title"
+  local c=""
+  if ((STEP_TOTAL > 0)); then printf -v c '(%*d/%d) ' "${#STEP_TOTAL}" "$STEP_N" "$STEP_TOTAL"; fi
+  printf '%s%s %s %s' "$c" "$1" "$STEP_NUM" "$STEP_TITLE"
+}
+_fit() {         # _fit TEXT -> TEXT cut to the terminal width (a wrapped line cannot be redrawn)
+  local cols=80 s
+  s=$(stty size </dev/tty 2>/dev/null || true)
+  if [[ $s =~ ^[0-9]+\ ([0-9]+)$ ]] && ((BASH_REMATCH[1] >= 20)); then cols=${BASH_REMATCH[1]}; fi
+  if ((${#1} > cols - 3)); then printf '%s...' "${1:0:cols-6}"; else printf '%s' "$1"; fi
+}
+spin_start() {   # spin_start TEXT - redraw "TEXT <frame>" until spin_stop
+  local text=$1 parent=$$
+  printf '\e[?25l' >&7; CURSOR_HIDDEN=true
+  {
+    _i=0
+    # stops by itself if the script is gone (kill -9) or the terminal closed
+    while kill -0 "$parent" 2>/dev/null; do
+      printf '\r%s %s' "$text" "${SPIN_FRAMES[_i % ${#SPIN_FRAMES[@]}]}" || exit 0
+      _i=$((_i + 1))
+      sleep 0.15
+    done
+  } >&7 2>/dev/null </dev/null &
+  SPIN_PID=$!
+}
+spin_stop() {    # stop the spinner, clear its line, show the cursor again
+  if [[ -n $SPIN_PID ]]; then
+    { kill "$SPIN_PID" && wait "$SPIN_PID"; } 2>/dev/null || true
+    SPIN_PID=""
+  fi
+  if [[ $CURSOR_HIDDEN == true ]]; then printf '\r\e[K\e[?25h' >&7 2>/dev/null || true; CURSOR_HIDDEN=false; fi
+  return 0
+}
+ui_line_start() {  # the line of a running step: redrawn with a spinner, or printed once
+  if [[ $UI_REDRAW == true ]]; then spin_start "$(_fit "$(_step_lead "$M_RUN")...")"
+  elif [[ $UI_TTY == true ]]; then printf '%s...\n' "$(_step_lead "$M_RUN")" >&7
+  else printf '%s\n' "$(_step_lead "$M_RUN")" >&7; fi
+}
+step_begin() {
+  _now
+  STEP_ON=true; STEP_NUM=$1; STEP_TITLE=$2; STEP_T0=$NOW
+  STEP_STATUS=ok; STEP_NOTE=""; STEP_INSTALLED=false; STEP_HEADED=false
+  STEP_N=$((STEP_N + 1))
+  ((RUN_T0 >= 0)) || RUN_T0=$NOW
+  [[ -n $STEP_FILE ]] || return 0      # --verbose: the header above is the title
+  : >"$STEP_FILE"; STEP_SHOWN=0
+  exec 1>>"$STEP_FILE" 2>&1
+  ui_line_start
+}
+# step_skip REASON - the step had nothing to do: [-] ... (skipped: REASON)
+step_skip() { STEP_STATUS=skip; STEP_NOTE=$1; }
+_step_detach() {   # spinner off, fds 1/2 back to the terminal
+  [[ -n $STEP_FILE ]] || return 0
+  spin_stop
+  exec 1>&7 2>&8
+}
+_step_flush() {    # the step's output -> the log
+  [[ -n $STEP_FILE && -s $STEP_FILE ]] || return 0
+  cat "$STEP_FILE" >>"$LOG_FILE"
+  : >"$STEP_FILE"
+}
+readonly TS_RE='^\[[0-9-]+ [0-9:]+\] ?'
+_step_warnings() { # WARNING lines and preflight WARN rows (with their fix line)
+  local l keep=false
+  while IFS= read -r l || [[ -n $l ]]; do
+    [[ $l =~ $TS_RE ]] || { keep=false; continue; }
+    l=${l#"${BASH_REMATCH[0]}"}
+    if [[ $l == "      WARNING: "* || $l == "  WARN  "* ]]; then printf '%s\n' "$l"; keep=true
+    elif [[ $keep == true && $l == "        fix: "* ]]; then printf '%s\n' "$l"
+    else keep=false; fi
+  done <"$STEP_FILE"
+  return 0
+}
+_step_text() {     # _step_text errors|other - the step's lines, timestamps removed
+  local l
+  while IFS= read -r l || [[ -n $l ]]; do
+    if [[ $l =~ $TS_RE ]]; then
+      l=${l#"${BASH_REMATCH[0]}"}
+      [[ -z $l ]] && continue
+      if [[ $l == "ERROR: "* ]]; then [[ $1 == errors ]] && printf '%s\n' "$l"; continue; fi
+    fi
+    [[ $1 == other ]] && printf '%s\n' "$l"
+  done <"$STEP_FILE"
+  return 0
+}
+step_close() {     # end the current step: [✓] or [-], its warnings, the log
+  [[ $STEP_ON == true ]] || return 0
+  local dur line color word l
+  _now; dur=$(_dur $((NOW - STEP_T0)))
+  if [[ $STEP_STATUS == skip ]]; then
+    line="$(_step_lead "$M_SKIP") (skipped: ${STEP_NOTE})"; color=$C_YELLOW; word=SKIP
+  else
+    line="$(_step_lead "$M_OK") (${dur})"; color=$C_GREEN; word=OK
+  fi
+  _step_detach
+  printf '%s%s%s\n' "$color" "$line" "${color:+$C_OFF}" >&7
+  if [[ -n $STEP_FILE ]]; then
+    # warnings stay visible under the step line (--verbose showed them already)
+    while IFS= read -r l; do printf '%s%s%s\n' "$C_YELLOW" "$l" "${C_YELLOW:+$C_OFF}" >&7; done < <(_step_warnings)
+  fi
+  STEP_ON=false
+  _step_flush
+  _record "[${word}] ${STEP_NUM} ${STEP_TITLE} (${dur}${STEP_NOTE:+, skipped: ${STEP_NOTE}})"
+  STEP_LINES+=("${STEP_STATUS}${US}${line}")
+}
+step_fail() {      # step_fail EXIT_CODE - red [✗] line, output tail, errors, hint, log
+  local rc=$1 note="" l hint=""
+  case $rc in 129|130|143) note=" (interrupted)" ;; esac
+  [[ -n $INTERRUPTED ]] && note=" (interrupted: ${INTERRUPTED})"
+  _step_detach
+  printf '%s%s%s\n' "$C_RED" "$(_step_lead "$M_FAIL")${note}" "${C_RED:+$C_OFF}" >&7
+  if [[ -n $STEP_FILE ]]; then
+    printf '    Last lines of output:\n' >&7
+    while IFS= read -r l; do printf '      %s\n' "$l" >&7; done < <(_step_text other | tail -n 15)
+    while IFS= read -r l; do printf '%s    %s%s\n' "$C_RED" "$l" "${C_RED:+$C_OFF}" >&7; done < <(_step_text errors)
+  fi
+  if [[ -n $FAIL_CMD ]]; then hint=$(fail_hint); fi
+  if [[ -n $hint ]]; then printf '%s    Hint: %s%s\n' "$C_YELLOW" "$hint" "${C_YELLOW:+$C_OFF}" >&7; fi
+  printf '    Full log: %s\n' "$LOG_FILE" >&7
+  STEP_ON=false
+  _step_flush
+  _record "[FAIL] ${STEP_NUM} ${STEP_TITLE}${note}"
+}
+# A plain command failed (ERR trap): the guide's fix for an error it knows.
+# Failures that stop through die() already print their own hint.
+fail_hint() {
+  local out
+  if [[ -n $STEP_FILE ]]; then out=$(<"$STEP_FILE"); else out=$(tail -n 200 "$LOG_FILE" 2>/dev/null || true); fi
+  case $out in
+    *"ERROR 1410"*) printf '%s' "MySQL 8 needs CREATE USER before GRANT - re-run: the script does both, in that order." ;;
+    *"ERROR 1050"*) printf '%s' "A partial schema is in the way: recreate the database with --reset on the DB node, then re-run." ;;
+    *AH00526*)      printf '%s' "Apache proxy modules missing: sudo a2enmod ${APACHE_MODS[*]} && sudo systemctl restart apache2" ;;
+    *"server.sql.gz: No such file"*) printf '%s' "Zabbix ${ZBX_VERSION} keeps the schema in ${SCHEMA_CANDIDATES[0]} (ls /usr/share/zabbix*/)." ;;
+    *"mysql: command not found"*) printf '%s' "Install the client: sudo apt install mysql-client -y" ;;
+    *"ERROR 1045"*|*"ERROR 1130"*|*"ERROR 1049"*|*"ERROR 2002"*|*"ERROR 2003"*|*"ERROR 2005"*|*"ERROR 2059"*|*"ERROR 2061"*)
+                    explain_mysql_error "$out" ;;
+    *"dpkg was interrupted"*) printf '%s' "An earlier apt run was interrupted: sudo dpkg --configure -a, then run the script again." ;;
+    *"Could not get lock"*) printf '%s' "Another apt/dpkg process is running (unattended-upgrades?): wait for it to finish, then run the script again." ;;
+    *"404"*"Not Found"*) printf '%s' "A 404 means a wrong repository path: it must include /release/ (zabbix/${ZBX_VERSION}/release/ubuntu/...)." ;;
+  esac
+  return 0
+}
+# ui_pause / ui_resume - around a question or a program that needs the
+# terminal (netplan try, passwd) inside a step: the spinner stops, the step's
+# output so far is shown as context, the terminal is handed over. Nested
+# calls are fine (only the outermost pair acts).
+ui_pause() {
+  UI_PAUSE=$((UI_PAUSE + 1))
+  [[ $UI_PAUSE == 1 && $STEP_ON == true && -n $STEP_FILE ]] || return 0
+  local l size
+  _step_detach
+  if [[ $STEP_HEADED != true ]]; then printf '%s--- Step %s: %s%s\n' "$C_BOLD" "$STEP_NUM" "$STEP_TITLE" "${C_BOLD:+$C_OFF}"; STEP_HEADED=true; fi
+  size=$(stat -c %s "$STEP_FILE" 2>/dev/null || echo 0)
+  while IFS= read -r l || [[ -n $l ]]; do
+    [[ $l =~ $TS_RE ]] && l=${l#"${BASH_REMATCH[0]}"}
+    [[ -z $l || $l == "--- Step "* ]] && continue
+    printf '%s\n' "$l"
+  done < <(tail -c +$((STEP_SHOWN + 1)) "$STEP_FILE" | tail -n 40)
+  STEP_SHOWN=$size
+  return 0
+}
+ui_resume() {
+  ((UI_PAUSE > 0)) && UI_PAUSE=$((UI_PAUSE - 1))
+  [[ $UI_PAUSE == 0 && $STEP_ON == true && -n $STEP_FILE ]] || return 0
+  STEP_SHOWN=$(stat -c %s "$STEP_FILE" 2>/dev/null || echo 0)
+  exec 1>>"$STEP_FILE" 2>&1
+  ui_line_start
+}
+steps_summary() {  # end of a real run: every step with its marker, total time
+  [[ $UI != classic ]] || return 0
+  step_close
+  local row st line color
+  part "Steps"
+  for row in "${STEP_LINES[@]}"; do
+    st=${row%%"$US"*}; line=${row#*"$US"}
+    if [[ $st == skip ]]; then color=$C_YELLOW; else color=$C_GREEN; fi
+    _emit "$color" "  ${line}"
+  done
+  _now
+  if ((RUN_T0 >= 0)); then say "  Total: $(_dur $((NOW - RUN_T0)))"; fi
+  return 0
+}
+# STEP_TOTAL - the steps this run will show, for the (n/total) counter
+count_steps() {
+  STEP_TOTAL=3                                    # 0.1 0.3 0.4
+  if [[ -n $ADD_USER ]]; then STEP_TOTAL=4; fi    # + 0.2
+  case $MODE in
+    db)     STEP_TOTAL=$((STEP_TOTAL + 6)) ;;     # 1.1 - 1.6
+    app)    STEP_TOTAL=$((STEP_TOTAL + 11)) ;;    # 2.1 - 2.9 with 2.5a, 2.7a
+    single) STEP_TOTAL=$((STEP_TOTAL + 16)) ;;    # 1.1 - 1.5 + Part 2
+  esac
+}
+# On exit: a step still open failed (or was interrupted). The spinner always
+# stops and the cursor always comes back.
+ui_exit() {
+  [[ $UI != classic ]] || return 0
+  if [[ $STEP_ON == true ]]; then
+    if (($1 != 0)) || [[ -n $INTERRUPTED ]]; then step_fail "$1"; else step_close; fi
+  fi
+  spin_stop
+  if [[ $UI_REDRAW == true ]]; then printf '\e[?25h' >&7 2>/dev/null || true; fi
+  return 0
+}
+
 cleanup() {
-  local p
+  local rc=$? p
+  ui_exit "$rc" || true
   for p in "${TMP_PATHS[@]}"; do [[ -n $p ]] && rm -rf -- "$p"; done
   return 0
 }
@@ -235,8 +570,10 @@ on_err() {
   local rc=$1 line=$2 cmd=$3
   if [[ $BASHPID != "$$" ]]; then exit "$rc"; fi   # subshell: parent reports
   trap - ERR
+  FAIL_CMD=$cmd
   err "Step ${CUR_STEP} failed (exit ${rc}, line ${line}): ${cmd}"
-  if [[ $LOG_ON == true ]]; then err "Full output: ${LOG_FILE}"; fi
+  # (inside a step, the step's [✗] block prints the log path)
+  if [[ $LOG_ON == true && $STEP_ON != true ]]; then err "Full output: ${LOG_FILE}"; fi
   err "Fix the cause and run the script again - it is safe to re-run."
   exit "$rc"
 }
@@ -280,6 +617,7 @@ v_dns() {
 v_username() { [[ $1 =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] && return 0; VERR="lowercase letters, digits, _ and - (max 32)"; return 1; }
 v_path()   { [[ -n $1 && $1 != *[[:cntrl:]]* ]] && return 0; VERR="not a usable path"; return 1; }
 v_yesno()  { [[ ${1,,} == yes || ${1,,} == no ]] && return 0; VERR="must be yes or no"; return 1; }
+v_verbose() { [[ -z $1 || ${1,,} =~ ^(0|1|yes|no|true|false)$ ]] && return 0; VERR="must be 1 (verbose) or 0"; return 1; }
 # Agent host name (Hostname= in zabbix_agent2.conf): no spaces, except the
 # package default "Zabbix server" that matches the built-in host.
 v_agent_host() {
@@ -359,6 +697,7 @@ ask() {
     die "${q} has no usable default (${VERR}). Pass it as a flag, a ZBX_${var} variable or in an env file (see --help)."
   fi
   if [[ -n $def ]]; then hint="[${def}]"; else hint="(Enter = leave blank)"; fi
+  ui_pause                          # (only acts inside a step)
   while true; do
     if [[ $USE_DIALOG == true ]]; then
       rc=0
@@ -369,7 +708,7 @@ ask() {
     fi
     ans=${ans#"${ans%%[![:space:]]*}"}; ans=${ans%"${ans##*[![:space:]]}"}
     ans=${ans:-$def}
-    if "$vfn" "$ans"; then printf -v "$var" '%s' "$ans"; _record "  ${q} ${ans}"; return 0; fi
+    if "$vfn" "$ans"; then printf -v "$var" '%s' "$ans"; _record "  ${q} ${ans}"; ui_resume; return 0; fi
     if [[ $USE_DIALOG == true ]]; then DLG_ERR=$VERR; else warn "${VERR} - try again."; fi
   done
 }
@@ -381,21 +720,22 @@ ask_yn() {
   local -a dopt=()
   [[ $def == y ]] && hint="[Y/n]"
   if [[ $ASSUME_YES == true ]]; then say "  ${q} ${hint} ${def}   (default, --yes)"; [[ $def == y ]]; return; fi
+  ui_pause                          # (only acts inside a step)
   if [[ $USE_DIALOG == true ]]; then
     [[ $def == y ]] || dopt=(--defaultno)
     text=$q
     if [[ -n $extra ]]; then text="${extra}"$'\n\n'"${q}"; fi
     if _dlg --title "Question" "${dopt[@]}" --yesno "$text" 16 76; then
-      _record "  ${q} -> yes"; return 0
+      _record "  ${q} -> yes"; ui_resume; return 0
     fi
-    _record "  ${q} -> no"; return 1
+    _record "  ${q} -> no"; ui_resume; return 1
   fi
   while true; do
     read -r -p "  ${q} ${hint} " ans || die "Input ended while asking: ${q}"
     ans=${ans:-$def}
     case ${ans,,} in
-      y|yes) _record "  ${q} -> yes"; return 0 ;;
-      n|no)  _record "  ${q} -> no"; return 1 ;;
+      y|yes) _record "  ${q} -> yes"; ui_resume; return 0 ;;
+      n|no)  _record "  ${q} -> no"; ui_resume; return 1 ;;
     esac
     warn "Please answer y or n."
   done
@@ -403,6 +743,7 @@ ask_yn() {
 
 read_hidden() {   # read_hidden VAR "prompt" - no echo, never logged
   local __v __rc=0 __p=$2
+  ui_pause                          # (only acts inside a step)
   if [[ $USE_DIALOG == true ]]; then
     __p=${__p#"${__p%%[![:space:]]*}"}
     # passwordbox: the typed text comes back through the fd swap in _dlg,
@@ -415,6 +756,7 @@ read_hidden() {   # read_hidden VAR "prompt" - no echo, never logged
     printf '\n' >&2
   fi
   printf -v "$1" '%s' "$__v"
+  ui_resume
 }
 
 # =============================================================================
@@ -734,6 +1076,7 @@ run_sql_root() {  # run_sql_root SQL_FOR_DISPLAY SQL_TO_RUN  (lines separated by
   for l in "${lines[@]}"; do sql_lines+=("mysql> ${l}"); done
   _action "\$ sudo mysql" "${sql_lines[@]}"
   if [[ $DRY_RUN == true ]]; then return 0; fi
+  _xcmd "mysql --protocol=socket --default-character-set=utf8mb4 -uroot -N -B   <<< the SQL above (password masked)"
   printf '%s\n%s\n' "$SQL_PREAMBLE" "$2" | mysql_root 2>&1 | _logpipe
 }
 
@@ -780,7 +1123,7 @@ usage() {
 zabbix-setup.sh ${SCRIPT_VERSION} - Zabbix ${ZBX_VERSION} LTS server setup for Ubuntu ${TARGET_UBUNTU}
 
 Usage: sudo ./zabbix-setup.sh [options]
-   or: sudo bash -c "\$(curl -fsSL ${SCRIPT_URL:-<URL>})" _ [options]
+   or: sudo bash -c 'bash <(curl -fsSL ${SCRIPT_URL:-<URL>}) "\$@"' _ [options]
 
 With no options a menu asks which role this machine has (whiptail dialogs on
 a terminal, plain text prompts otherwise):
@@ -807,6 +1150,8 @@ Actions
   --agent | --no-agent   install Zabbix Agent 2 on this server, or not (default yes).
                          app/single: it monitors the server itself, not the Windows PC;
                          db: it lets the Zabbix server monitor the database server
+  --verbose, -v          show every command (\$ ...) and its live output under each step
+                         (default: one line per step - [✗] while running, [✓] done, [-] skipped)
   --force                continue on a non-${TARGET_UBUNTU} OS or a role mismatch
   --yes, -y              accept every default, never prompt
   --help, -h             this text
@@ -835,8 +1180,21 @@ Values  (priority: flag > environment variable > env file > prompt)
   --agent / --no-agent   ZBX_INSTALL_AGENT yes|no
   --agent-hostname NAME  ZBX_AGENT_HOSTNAME Hostname= of that agent (= host name in the web UI);
                                            db default: hostname -s; app/single: Zabbix server
+  --verbose / -v         ZBX_VERBOSE       1 = verbose output, 0 = one line per step (default)
 
 There is no --db-password flag on purpose: it would leak into shell history and ps.
+
+Output
+  A real run shows one line per step, numbered like the guide, redrawn in place:
+      (7/9) [✗] 1.4 Create the database and user ...   <- running (spinner)
+      (7/9) [✓] 1.4 Create the database and user ... (2s)
+      (9/9) [-] 1.6 Install Zabbix Agent 2 ... (skipped: agent not requested)
+  What the commands print goes to ${LOG_FILE} only (never the
+  password). A failed step shows its last 15 lines, the error and a hint.
+  --verbose prints every command and its output instead.
+  Not a terminal (piped, cron): plain [..] / [OK] / [FAIL] lines.
+  NO_COLOR=1 or TERM=dumb: no colours, no redraw. Non-UTF-8 locale: ASCII
+  markers [ ] running, [v] done, [x] failed. --dry-run and --verify: as before.
 
 Env file
   Lines of the form ZBX_NAME=value (optional 'export ', optional '...' or "..."
@@ -894,6 +1252,7 @@ parse_args() {
       --agent)            INSTALL_AGENT=yes; SRC[INSTALL_AGENT]="flag --agent"; shift ;;
       --no-agent)         INSTALL_AGENT=no; SRC[INSTALL_AGENT]="flag --no-agent"; shift ;;
       --agent-hostname)   _setv AGENT_HOSTNAME "$@"; shift 2 ;;
+      --verbose|-v)       VERBOSE=1; SRC[VERBOSE]="flag $1"; shift ;;
       --dry-run)          DRY_RUN=true; shift ;;
       --verify)           DO_VERIFY=true; shift ;;
       --reset)            RESET=true; shift ;;
@@ -919,6 +1278,7 @@ declare -rA ENV_VALIDATORS=(
   [DB_USER]=v_dbuser [TIMEZONE]=v_tz [WIN_HOSTNAME]=v_winhost [WIN_IP]=v_ip_opt
   [IFACE]=v_iface [STATIC_IP]=v_ip [PREFIX]=v_prefix [GATEWAY]=v_ip [DNS]=v_dns
   [SSH_KEY_FILE]=v_path [DB_PASSWORD]=v_password [INSTALL_AGENT]=v_yesno [AGENT_HOSTNAME]=v_agent_host
+  [VERBOSE]=v_verbose
 )
 _env_unquote() {   # _env_unquote RAW -> REPLY (outer quotes off, literal)
   local v=$1 q
@@ -1341,6 +1701,7 @@ build_summary() {   # SUMMARY_LINES - shown as text and in the dialog (password 
   fi
   [[ -n $ENV_FILE ]] && SUMMARY_LINES+=("  Env file      : ${ENV_FILE}")
   SUMMARY_LINES+=("  Output files  : ${OUT_DIR}")
+  if [[ $UI != classic ]]; then SUMMARY_LINES+=("  Display       : $(ui_mode_text)" "  Full output   : ${LOG_FILE}"); fi
   return 0
 }
 show_summary() {
@@ -1511,6 +1872,7 @@ apt_install() {
   if [[ $DRY_RUN == true ]]; then missing=("$@")
   else for p in "$@"; do pkg_installed "$p" || missing+=("$p"); done; fi
   if ((${#missing[@]} == 0)); then _action "\$ ${shown}"; skip "already installed: $*"; return 0; fi
+  STEP_INSTALLED=true
   run_show "$shown" env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y "${missing[@]}"
 }
 
@@ -1533,7 +1895,9 @@ add_admin_user() {
     [[ -r $SSH_KEY_FILE ]] || die "Cannot read SSH key file ${SSH_KEY_FILE}"
     key=$(grep -m1 -E '^(ssh-|ecdsa-|sk-)' "$SSH_KEY_FILE" || true)
   elif [[ $ASSUME_YES != true ]]; then
+    ui_pause
     IFS= read -r -p "  SSH public key for ${name} (path to a .pub file, or paste the key line; Enter = skip): " ans || ans=""
+    ui_resume
     if [[ -n $ans && -r $ans ]]; then key=$(grep -m1 -E '^(ssh-|ecdsa-|sk-)' "$ans" || true); else key=$ans; fi
   fi
   key=${key%$'\r'}
@@ -1558,7 +1922,10 @@ add_admin_user() {
   if [[ $DRY_RUN == true ]]; then
     _action "\$ sudo passwd ${name}   # needed so ${name} can use sudo"
   elif [[ $ASSUME_YES != true ]] && ask_yn "Set a login password for ${name} now (needed for sudo)?" y; then
+    ui_pause                        # passwd talks to the terminal itself
+    _xcmd "passwd ${name}"
     passwd "$name" || warn "passwd failed - run: sudo passwd ${name}"
+    ui_resume
   else
     info "Remember: sudo passwd ${name}"
   fi
@@ -1568,9 +1935,10 @@ add_admin_user() {
 apply_static_ip() {
   step 0.3 "Static IP for this server"
   case $NET_ACTION in
-    keep) ok "static address ${HOST_IP} on ${IFACE} - nothing to change"; return 0 ;;
+    keep) ok "static address ${HOST_IP} on ${IFACE} - nothing to change"; step_skip "${HOST_IP} is already static"; return 0 ;;
     skip)
       warn "Skipped. If this address (${HOST_IP:-unknown}) changes, the MySQL user / Windows agent config break. Re-run later to fix, or reserve the IP in DHCP."
+      step_skip "not requested"
       return 0 ;;
   esac
   local f yaml dns_list
@@ -1607,6 +1975,7 @@ EOF
   if [[ $APPLY_NETWORK != true && $ASSUME_YES == true ]]; then
     warn "Not applied and nothing written: --yes never changes the network by itself. The YAML above is what would be written."
     warn "Reminder: re-run with --apply-network to apply it (netplan try), from the VM console if the address changes."
+    step_skip "printed only - --yes needs --apply-network"
     return 0
   fi
   warn "Changing the IP over SSH can drop your session. netplan try rolls back after ${NETPLAN_TRY_TIMEOUT} s unless you press ENTER."
@@ -1615,24 +1984,34 @@ EOF
   fi
   if [[ $APPLY_NETWORK != true ]] && ! ask_yn "Apply this static IP now?" n; then
     warn "Not applied. Reminder: a changing DHCP address will break the setup later."
+    step_skip "not applied"
     return 0
   fi
   if [[ ! -t 0 ]]; then
     warn "Not applied: netplan try needs a terminal to confirm with ENTER (stdin is not a terminal). Nothing was written."
+    step_skip "netplan try needs a terminal"
     return 0
   fi
   printf '%s\n' "$yaml" >"$NETPLAN_FILE"
   chmod 600 "$NETPLAN_FILE"
+  _xcmd "netplan generate"
   if ! netplan generate 2>&1 | _logpipe; then
-    rm -f "$NETPLAN_FILE"; warn "netplan generate rejected the file - removed it, nothing applied."; return 0
+    rm -f "$NETPLAN_FILE"; warn "netplan generate rejected the file - removed it, nothing applied."
+    step_skip "netplan generate rejected the file"
+    return 0
   fi
+  # netplan try asks for ENTER on the terminal: no spinner over it
+  ui_pause
+  _xcmd "netplan try --timeout ${NETPLAN_TRY_TIMEOUT}"
   netplan try --timeout "$NETPLAN_TRY_TIMEOUT" || true
+  ui_resume
   net_detect
   if [[ $DET_IP == "$STATIC_IP" && $DET_DYNAMIC != yes ]]; then
     ok "static IP ${STATIC_IP}/${PREFIX} active on ${IFACE}"
   else
     rm -f "$NETPLAN_FILE"
     warn "Static IP not confirmed (rolled back). Removed ${NETPLAN_FILE}; previous files are in ${BACKUP_DIR}${NETPLAN_DIR}."
+    step_skip "not confirmed - rolled back"
   fi
 }
 
@@ -1683,6 +2062,7 @@ part1_database() {
   if [[ $DRY_RUN != true ]]; then
     mysql_wait_ready || die "MySQL did not start. Check: sudo systemctl status mysql; sudo journalctl -u mysql -n 50"
   fi
+  [[ $STEP_INSTALLED == true ]] || step_skip "mysql-server already installed"
 
   # ---- 1.2 bind-address and port ------------------------------------------
   local need_restart=0
@@ -1710,6 +2090,7 @@ part1_database() {
       restart_mysql_on_port "$MYSQL_DEFAULT_PORT"
     else
       skip "single VM: keep bind-address 127.0.0.1 and the local socket - no edit needed"
+      step_skip "single VM uses the local socket"
     fi
   fi
 
@@ -1719,6 +2100,7 @@ part1_database() {
     open_db_firewall
   else
     skip "single VM: MySQL is only used locally - nothing to open"
+    step_skip "single VM: MySQL is only used locally"
   fi
 
   # ---- 1.4 Database and user ---------------------------------------------------
@@ -1822,6 +2204,7 @@ restart_mysql_if_needed() {  # restart_mysql_if_needed PORT 0|1
   if [[ $2 == 0 ]]; then
     _action "\$ sudo systemctl restart mysql"
     skip "bind-address/port already set and MySQL listens on $(listen_addrs "$1") - no restart needed"
+    step_skip "already set - no restart needed"
     return 0
   fi
   restart_mysql_on_port "$1"
@@ -1847,6 +2230,7 @@ open_db_firewall() {
   if [[ $st != active ]]; then
     skip "ufw is ${st} - nothing to open (this script never enables ufw)"
     FW_SKIPPED+=("${DB_PORT}/tcp (ufw ${st})")
+    step_skip "ufw is ${st}"
     return 0
   fi
   # A previous run with another port or app IP: remove its rule first.
@@ -1880,6 +2264,7 @@ reset_database() {
   [[ $DRY_RUN == true ]] && return 0
   [[ $RESET_CONFIRMED == true ]] || die "--reset was not confirmed - nothing was dropped."
   if [[ $MODE == single ]] && svc_active zabbix-server; then run systemctl stop zabbix-server; fi
+  _xcmd "mysql --protocol=socket --default-character-set=utf8mb4 -uroot -N -B   <<< DROP DATABASE IF EXISTS \`${DB_NAME}\`;"
   printf '%s\n' "DROP DATABASE IF EXISTS \`${DB_NAME}\`;" | mysql_root 2>&1 | _logpipe
   ok "database ${DB_NAME} dropped - it is recreated empty below"
 }
@@ -1914,6 +2299,7 @@ db_install_agent() {
   step 1.6 "Install Zabbix Agent 2 on the database server (monitored by ${APP_IP})"
   if [[ $INSTALL_AGENT != yes ]]; then
     say "      repository, zabbix-agent2 package, ${ZBX_AGENT_CONF}, service, ufw ${ZBX_AGENT_PORT}/tcp: (skipped: agent not requested)"
+    step_skip "agent not requested"
     if [[ $DRY_RUN != true ]] && pkg_installed zabbix-agent2; then info "Agent 2 was already installed; leaving it as it is"; fi
     return 0
   fi
@@ -1992,6 +2378,7 @@ part2_app() {
   fi
   detect_php_fpm
   detect_schema_file
+  [[ $STEP_INSTALLED == true ]] || step_skip "all packages already installed"
 
   # ---- 2.3 Schema import -------------------------------------------------------
   if [[ $MODE == app ]]; then step 2.3 "Import the schema into the remote DB node ${DB_IP}:${DB_PORT}"
@@ -2019,6 +2406,7 @@ part2_app() {
   _action "\$ sudo apache2ctl configtest"
   if [[ $DRY_RUN != true ]]; then
     local out
+    _xcmd "apache2ctl configtest"
     if ! out=$(apache2ctl configtest 2>&1); then
       printf '%s\n' "$out" | _logpipe
       if [[ $out == *AH00526* ]]; then
@@ -2037,6 +2425,7 @@ part2_app() {
   step 2.6 "Generate the ${ZBX_LOCALE} locale"
   if [[ $DRY_RUN != true ]] && has_locale; then
     _action "\$ sudo locale-gen ${ZBX_LOCALE}"; skip "${ZBX_LOCALE} already generated"
+    step_skip "already generated"
   else
     if [[ $DRY_RUN != true ]] && ! command -v locale-gen >/dev/null 2>&1; then
       apt_install "sudo apt install locales -y" locales
@@ -2075,7 +2464,9 @@ part2_app() {
 
   # ---- 2.8 / 2.9 Manual ----------------------------------------------------------
   step 2.8 "Complete the frontend web wizard - manual, values in NEXT STEPS"
+  step_skip "manual step"
   step 2.9 "Log into the Zabbix website (Admin / zabbix) - manual, see NEXT STEPS"
+  step_skip "manual step"
 }
 
 # app/single: zabbix_agent2.conf keeps the package's Hostname=Zabbix server
@@ -2106,8 +2497,10 @@ app_services() {
 stop_zabbix_server() {
   svc_active zabbix-server || return 0
   info "stopping the running zabbix-server first (it flushes its cache to the DB)"
+  _xcmd "timeout 60 systemctl stop zabbix-server"
   if timeout 60 systemctl stop zabbix-server 2>&1 | _logpipe; then return 0; fi
   warn "zabbix-server did not stop within 60 s - its old database is unreachable. Killing it (unsent history is lost)."
+  _xcmd "systemctl kill --signal=SIGKILL zabbix-server"
   systemctl kill --signal=SIGKILL zabbix-server 2>&1 | _logpipe || true
   local i
   for ((i = 0; i < 15; i++)); do svc_active zabbix-server || break; sleep 1; done
@@ -2148,6 +2541,7 @@ import_schema() {
 
   _action "\$ ${shown_conn} ${DB_NAME} -e 'SELECT VERSION();'   # test the connection first"
   if [[ $DRY_RUN != true ]]; then
+    _xcmd "mysql --defaults-extra-file=${CNF} --default-character-set=utf8mb4 --connect-timeout=5 ${DBC_ARGS[*]} -N -B ${DB_NAME} -e 'SELECT VERSION()'"
     out=$(mysql_zbx "$DB_NAME" -e "SELECT VERSION()" 2>&1) || die "Cannot log in to ${DB_NAME} as ${DB_USER}: $(explain_mysql_error "$out")"
     ok "connected - MySQL ${out}"
     state=$(schema_state mysql_zbx)
@@ -2158,7 +2552,8 @@ import_schema() {
   _action "\$ zcat ${SCHEMA_FILE} | ${shown_conn} --default-character-set=utf8mb4 ${DB_NAME}   # 1-2 minutes"
   case $state in
     full)
-      skip "schema already imported (dbversion and users tables present)" ;;
+      skip "schema already imported (dbversion and users tables present)"
+      step_skip "already imported" ;;
     partial)
       die "The database '${DB_NAME}' holds a PARTIAL schema - importing again would stop with ERROR 1050 (table already exists)." \
           "Recreate it on the DB node:  sudo ${LAUNCH} --mode $([[ $MODE == app ]] && echo db || echo single) --reset" ;;
@@ -2171,6 +2566,7 @@ import_schema() {
         fi
         info "importing ${SCHEMA_FILE} - this takes 1-2 minutes..."
         errf=$(mktemp); TMP_PATHS+=("$errf")
+        _xcmd "zcat ${SCHEMA_FILE} | mysql --defaults-extra-file=${CNF} --default-character-set=utf8mb4 --connect-timeout=5 ${DBC_ARGS[*]} -N -B --default-character-set=utf8mb4 ${DB_NAME}"
         zcat "$SCHEMA_FILE" | mysql_zbx --default-character-set=utf8mb4 "$DB_NAME" 2>"$errf" || rc=$?
         if ((rc != 0)); then
           _logpipe <"$errf"
@@ -2279,6 +2675,7 @@ open_app_firewall() {
   if [[ $st != active ]]; then
     skip "ufw is ${st} - nothing to open (this script never enables ufw)"
     FW_SKIPPED+=("${HTTP_PORT}/tcp" "${ZBX_TRAPPER_PORT}/tcp")
+    step_skip "ufw is ${st}"
   else
     for p in "$HTTP_PORT" "$ZBX_TRAPPER_PORT"; do
       run ufw allow "${p}/tcp"
@@ -2795,11 +3192,14 @@ main() {
 
   # whiptail dialogs on a terminal; plain text prompts otherwise
   if [[ $NO_DIALOG != true && $ASSUME_YES != true ]] && dialog_possible; then USE_DIALOG=true; fi
+  ui_init                                     # one line per step / --verbose / plain
 
   # --add-user on its own ---------------------------------------------------------
   if [[ -n $ADD_USER && -z $MODE ]]; then
     part "Part 0 - Preparation"
+    STEP_TOTAL=1
     add_admin_user
+    steps_summary
     exit 0
   fi
 
@@ -2823,6 +3223,7 @@ main() {
     end_dialogs; show_summary
   fi
 
+  count_steps                                 # for the (n/total) counter
   preflight                                   # 0.1
   [[ -n $ADD_USER ]] && add_admin_user        # 0.2
   apply_static_ip                             # 0.3
@@ -2833,6 +3234,7 @@ main() {
     app)    part2_app ;;
     single) part1_database; part2_app ;;
   esac
+  steps_summary                               # real runs: every step + total time
 
   if [[ $MODE != db ]]; then part "Part 3 - Windows 11 agent (manual - see NEXT STEPS)"; fi
 
@@ -2872,7 +3274,8 @@ main() {
   fi
 }
 
-# Run main when executed as a file, or as  bash -c "$(curl -fsSL URL)" _ ...
+# Run main when executed as a file, as the one-liner  bash <(curl -fsSL URL)
+# (BASH_SOURCE and $0 are the same /dev/fd/N), or as  bash -c "$(cat FILE)" _
 # (no file: BASH_SOURCE is empty). When the file is sourced, define only.
 if [[ -z ${BASH_SOURCE[0]:-} || ${BASH_SOURCE[0]} == "$0" ]]; then
   main "$@"

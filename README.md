@@ -1,6 +1,6 @@
 # scripts
 
-Small automation scripts and guides from my sysadmin studies and homelab. The main project is [`zabbix/zabbix-setup.sh`](zabbix/zabbix-setup.sh) (version 1.2.0). It sets up the **server side** of Zabbix 8.0 LTS on Ubuntu 26.04, either on one VM or split between a database server and an app/web server. It installs MySQL, the Zabbix server, the Apache + PHP-FPM frontend and (optionally) Zabbix Agent 2 on each server, then checks the result. The Windows 11 agent stays **manual**: the script ends by printing the exact values to type on Windows and in the web UI.
+Small automation scripts and guides from my sysadmin studies and homelab. The main project is [`zabbix/zabbix-setup.sh`](zabbix/zabbix-setup.sh) (version 1.3.0). It sets up the **server side** of Zabbix 8.0 LTS on Ubuntu 26.04, either on one VM or split between a database server and an app/web server. It installs MySQL, the Zabbix server, the Apache + PHP-FPM frontend and (optionally) Zabbix Agent 2 on each server, then checks the result. The Windows 11 agent stays **manual**: the script ends by printing the exact values to type on Windows and in the web UI.
 
 | Folder | What it is |
 |---|---|
@@ -20,14 +20,16 @@ Small automation scripts and guides from my sysadmin studies and homelab. The ma
 Start it in one line on each Ubuntu server:
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Moonbara/scripts/main/zabbix/zabbix-setup.sh)"
+sudo bash -c 'bash <(curl -fsSL https://raw.githubusercontent.com/Moonbara/scripts/main/zabbix/zabbix-setup.sh) "$@"' _
 ```
 
-To pass options, put them after a `_` placeholder:
+To pass options, put them after the `_` placeholder:
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Moonbara/scripts/main/zabbix/zabbix-setup.sh)" _ --mode db
+sudo bash -c 'bash <(curl -fsSL https://raw.githubusercontent.com/Moonbara/scripts/main/zabbix/zabbix-setup.sh) "$@"' _ --mode db --verbose
 ```
+
+> The older form `sudo bash -c "$(curl -fsSL URL)"` no longer works: Linux refuses a single argument over 128 KiB ("Argument list too long"), and the script is bigger than that since version 1.2.0. The form above reads the script through a pipe, so its size does not matter, and your terminal stays connected for the questions.
 
 Or download it, read it, then run the local copy:
 
@@ -42,10 +44,29 @@ sudo ./zabbix-setup.sh
 > **Read the script before running it as root.** Piping a script from the internet into a root shell runs whatever that URL serves at that moment. To pin an exact version, replace `main` in the URL with a tag or a commit hash, for example the release tag `zabbix-v1.1.1`:
 >
 > ```bash
-> sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Moonbara/scripts/zabbix-v1.1.1/zabbix/zabbix-setup.sh)"
+> sudo bash -c 'bash <(curl -fsSL https://raw.githubusercontent.com/Moonbara/scripts/zabbix-v1.1.1/zabbix/zabbix-setup.sh) "$@"' _
 > ```
 
 With no options, a menu asks which role the machine has: **1** single VM, **2** database server (run it first), **3** app/web server (run it second). Output files are written to the current directory.
+
+## What a run looks like
+
+Each step is one line, numbered like the guide. While a step runs, its line shows `[✗]` (not finished yet) and a spinner. When it ends, the line turns into a green `[✓]` with its duration, or a yellow `[-]` when there was nothing to do:
+
+```text
+==================== Part 1 - Database node ====================
+( 4/19) [✓] 1.1 Install MySQL (14s)
+( 5/19) [-] 1.2 Remote access / custom port (skipped: single VM uses the local socket)
+( 6/19) [-] 1.3 Open the firewall for MySQL (skipped: single VM: MySQL is only used locally)
+( 7/19) [✓] 1.4 Create the database and user (CREATE USER before GRANT - MySQL 8) (0s)
+( 8/19) [✗] 1.5 Verify the zabbix user can log in (local socket)... ⠹
+```
+
+- **Where the output goes:** everything the commands print (apt, mysql, systemctl…) goes to `/var/log/zabbix-setup.log` only, never with the password. Warnings still show under their step.
+- **When a step fails:** its line stays a red `[✗]`, followed by the step's last 15 lines of output, the error with its fix, and the log path.
+- **At the end:** a list of every step with the total time, then the verification table and the NEXT STEPS block.
+- **`--verbose` / `-v`** (or `ZBX_VERBOSE=1`): every command is printed as `$ ...`, with its live output indented underneath.
+- **No terminal:** when the output is piped or captured, you get plain `[..]` / `[OK]` / `[FAIL]` lines with no escape codes. `NO_COLOR=1` or `TERM=dumb` turn off colours and the redraw. A non-UTF-8 locale gets ASCII markers: `[ ]` running, `[v]` done, `[x]` failed.
 
 ## Options
 
@@ -62,6 +83,7 @@ With no options, a menu asks which role the machine has: **1** single VM, **2** 
 | `--no-dialog` | Plain text prompts instead of whiptail dialogs |
 | `--agent` / `--no-agent` | Install Zabbix Agent 2 on this server, or not (all modes, default: yes; see below) |
 | `--agent-hostname NAME` | `Hostname=` of that agent, and the host name to use in the web UI |
+| `--verbose`, `-v` | Show every command (`$ ...`) and its live output under each step, instead of one line per step (also `ZBX_VERBOSE=1`) |
 | `--force` | Continue on another OS version or a role mismatch |
 | `--yes`, `-y` | Accept every default, no prompts |
 | `--help`, `-h` | Full list, including every value flag |

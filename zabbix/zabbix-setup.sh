@@ -22,11 +22,12 @@
 #  does not contain is marked:
 #    Part 0       preparation: 0.1 preflight, 0.2 admin user, 0.3 static IP,
 #                 0.4 time sync + timezone
+#    1.6          optional Agent 2 on the database server (db mode)
 #    2.5a / 2.7a  extra sub-steps: PHP timezone, firewall for web + agents
 #
 #  Map of this file:
 #     0. constants and defaults        6. Part 0 (steps 0.2 - 0.4)
-#     1. output, logging, run()        7. Part 1 - database node (1.1 - 1.5)
+#     1. output, logging, run()        7. Part 1 - database node (1.1 - 1.6)
 #     2. validators and prompts        8. Part 2 - app/web node  (2.1 - 2.9)
 #     3. config-file editing           9. hand-off, NEXT STEPS, state file
 #     4. system and MySQL helpers     10. --verify
@@ -38,7 +39,7 @@ umask 022
 # =============================================================================
 # 0. Constants and defaults - the only place versions, ports and paths live
 # =============================================================================
-readonly SCRIPT_VERSION="1.1.1"
+readonly SCRIPT_VERSION="1.2.0"
 # Optional: where the script is published. Only used to print the one-line
 # launch command (leave it empty to print <URL> instead). Pin a tag or a
 # commit instead of main for anything you rely on.
@@ -71,6 +72,8 @@ readonly STATE_FILE="/etc/zabbix-setup.state"
 readonly BACKUP_ROOT="/var/backups/zabbix-setup"
 readonly MYSQLD_CNF="/etc/mysql/mysql.conf.d/mysqld.cnf"
 readonly ZBX_SERVER_CONF="/etc/zabbix/zabbix_server.conf"
+readonly ZBX_AGENT_CONF="/etc/zabbix/zabbix_agent2.conf"
+readonly ZBX_DEFAULT_AGENT_HOST="Zabbix server"   # package default = the built-in host
 readonly ZBX_SERVER_LOG="/var/log/zabbix/zabbix_server.log"
 readonly ZBX_APACHE_CONF="/etc/zabbix/apache.conf"
 readonly ZBX_PHP_POOL_GUESS="/etc/zabbix/php-fpm.conf"
@@ -117,7 +120,7 @@ USE_DIALOG=false; RESET_CONFIRMED=false
 #     The internal names (MODE, DB_PORT, ...) stay unprefixed.
 declare -A SRC=()
 readonly -a INPUT_VARS=(MODE APP_IP DB_IP DB_PORT DB_NAME DB_USER TIMEZONE WIN_HOSTNAME WIN_IP
-                        IFACE STATIC_IP PREFIX GATEWAY DNS SSH_KEY_FILE INSTALL_AGENT)
+                        IFACE STATIC_IP PREFIX GATEWAY DNS SSH_KEY_FILE INSTALL_AGENT AGENT_HOSTNAME)
 for _v in "${INPUT_VARS[@]}"; do
   _e="ZBX_${_v}"
   if [[ -n ${!_e:-} ]]; then printf -v "$_v" '%s' "${!_e}"; SRC[$_v]="environment ${_e}"
@@ -156,7 +159,7 @@ V_ROWS=(); V_FAILS=0; V_WARNS=0
 PF_HINTS=()
 CNF=""; DBC_ARGS=()
 ST_MODE=""; ST_APP_IP=""; ST_DB_IP=""; ST_DB_PORT=""; ST_DB_NAME=""; ST_DB_USER=""; ST_TIMEZONE=""
-ST_INSTALL_AGENT=""
+ST_INSTALL_AGENT=""; ST_AGENT_HOSTNAME=""
 
 # =============================================================================
 # 1. Output, logging and the run() wrapper
@@ -277,6 +280,12 @@ v_dns() {
 v_username() { [[ $1 =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] && return 0; VERR="lowercase letters, digits, _ and - (max 32)"; return 1; }
 v_path()   { [[ -n $1 && $1 != *[[:cntrl:]]* ]] && return 0; VERR="not a usable path"; return 1; }
 v_yesno()  { [[ ${1,,} == yes || ${1,,} == no ]] && return 0; VERR="must be yes or no"; return 1; }
+# Agent host name (Hostname= in zabbix_agent2.conf): no spaces, except the
+# package default "Zabbix server" that matches the built-in host.
+v_agent_host() {
+  [[ $1 == "$ZBX_DEFAULT_AGENT_HOST" || $1 =~ ^[A-Za-z0-9._-]{1,128}$ ]] && return 0
+  VERR="letters, digits, . _ - only (max 128, no spaces; only the default '${ZBX_DEFAULT_AGENT_HOST}' has one)"; return 1
+}
 normalize_mode() { case ${1,,} in 1) echo single ;; 2) echo db ;; 3) echo app ;; *) echo "${1,,}" ;; esac; }
 TZ_LIST=""
 v_tz() {
@@ -795,8 +804,9 @@ Actions
   --env-file PATH        load ZBX_* values from PATH (default: ./zabbix-setup.env if present)
   --no-env-password      leave ZBX_DB_PASSWORD out of the ./zabbix-setup.env written at the end
   --no-dialog            plain text prompts instead of whiptail dialogs
-  --agent | --no-agent   app/single: install Zabbix Agent 2 on this server, or not
-                         (default yes; it monitors the server itself, not the Windows PC)
+  --agent | --no-agent   install Zabbix Agent 2 on this server, or not (default yes).
+                         app/single: it monitors the server itself, not the Windows PC;
+                         db: it lets the Zabbix server monitor the database server
   --force                continue on a non-${TARGET_UBUNTU} OS or a role mismatch
   --yes, -y              accept every default, never prompt
   --help, -h             this text
@@ -822,7 +832,9 @@ Values  (priority: flag > environment variable > env file > prompt)
                          given are detected. Applying still needs a yes or --apply-network.
   --mode                 ZBX_MODE
   --ssh-key-file F       ZBX_SSH_KEY_FILE  public key for --add-user
-  --agent / --no-agent   ZBX_INSTALL_AGENT yes|no (app/single; db never installs an agent)
+  --agent / --no-agent   ZBX_INSTALL_AGENT yes|no
+  --agent-hostname NAME  ZBX_AGENT_HOSTNAME Hostname= of that agent (= host name in the web UI);
+                                           db default: hostname -s; app/single: Zabbix server
 
 There is no --db-password flag on purpose: it would leak into shell history and ps.
 
@@ -881,6 +893,7 @@ parse_args() {
       --no-dialog)        NO_DIALOG=true; shift ;;
       --agent)            INSTALL_AGENT=yes; SRC[INSTALL_AGENT]="flag --agent"; shift ;;
       --no-agent)         INSTALL_AGENT=no; SRC[INSTALL_AGENT]="flag --no-agent"; shift ;;
+      --agent-hostname)   _setv AGENT_HOSTNAME "$@"; shift 2 ;;
       --dry-run)          DRY_RUN=true; shift ;;
       --verify)           DO_VERIFY=true; shift ;;
       --reset)            RESET=true; shift ;;
@@ -905,7 +918,7 @@ declare -rA ENV_VALIDATORS=(
   [MODE]=v_mode [APP_IP]=v_ip [DB_IP]=v_ip [DB_PORT]=v_port [DB_NAME]=v_dbname
   [DB_USER]=v_dbuser [TIMEZONE]=v_tz [WIN_HOSTNAME]=v_winhost [WIN_IP]=v_ip_opt
   [IFACE]=v_iface [STATIC_IP]=v_ip [PREFIX]=v_prefix [GATEWAY]=v_ip [DNS]=v_dns
-  [SSH_KEY_FILE]=v_path [DB_PASSWORD]=v_password [INSTALL_AGENT]=v_yesno
+  [SSH_KEY_FILE]=v_path [DB_PASSWORD]=v_password [INSTALL_AGENT]=v_yesno [AGENT_HOSTNAME]=v_agent_host
 )
 _env_unquote() {   # _env_unquote RAW -> REPLY (outer quotes off, literal)
   local v=$1 q
@@ -971,7 +984,7 @@ load_state() {
   local line key val
   [[ -r $STATE_FILE ]] || return 0
   while IFS= read -r line || [[ -n $line ]]; do
-    [[ $line =~ ^(MODE|APP_IP|DB_IP|DB_PORT|DB_NAME|DB_USER|TIMEZONE|INSTALL_AGENT)=(.*)$ ]] || continue
+    [[ $line =~ ^(MODE|APP_IP|DB_IP|DB_PORT|DB_NAME|DB_USER|TIMEZONE|INSTALL_AGENT|AGENT_HOSTNAME)=(.*)$ ]] || continue
     key=${BASH_REMATCH[1]}; val=${BASH_REMATCH[2]}
     printf -v "ST_${key}" '%s' "$val"
   done <"$STATE_FILE"
@@ -985,8 +998,9 @@ write_state() {
     printf '# zabbix-setup.sh state - non-secret settings of the last successful run (read by --verify)\n'
     printf 'MODE=%s\nAPP_IP=%s\nDB_IP=%s\nDB_PORT=%s\nDB_NAME=%s\nDB_USER=%s\nTIMEZONE=%s\nUPDATED=%s\n' \
       "$MODE" "$APP_IP" "$DB_IP" "$port" "$DB_NAME" "$DB_USER" "$TIMEZONE" "$(date '+%F %T')"
-    # db mode never has the server agent, so only app/single record the choice
-    if [[ $MODE != db ]]; then printf 'INSTALL_AGENT=%s\n' "$INSTALL_AGENT"; fi
+    # the Agent 2 choice (all modes) and, when installed, its host name
+    printf 'INSTALL_AGENT=%s\n' "$INSTALL_AGENT"
+    if [[ $INSTALL_AGENT == yes ]]; then printf 'AGENT_HOSTNAME=%s\n' "$AGENT_HOSTNAME"; fi
   } >"${STATE_FILE}.tmp"
   chmod 600 "${STATE_FILE}.tmp"
   mv -f "${STATE_FILE}.tmp" "$STATE_FILE"
@@ -1189,7 +1203,7 @@ _keep_password() {
 
 collect_inputs() {
   part "Settings (${MODE})"
-  if [[ $ST_MODE != "$MODE" ]]; then ST_APP_IP=""; ST_DB_IP=""; ST_DB_PORT=""; ST_DB_NAME=""; ST_DB_USER=""; ST_INSTALL_AGENT=""; fi
+  if [[ $ST_MODE != "$MODE" ]]; then ST_APP_IP=""; ST_DB_IP=""; ST_DB_PORT=""; ST_DB_NAME=""; ST_DB_USER=""; ST_INSTALL_AGENT=""; ST_AGENT_HOSTNAME=""; fi
   static_ip_prompt
   case $MODE in
     db)
@@ -1238,26 +1252,47 @@ collect_inputs() {
   confirm_reset
 }
 
-# INSTALL_AGENT (app/single): Zabbix Agent 2 on this server, which monitors
-# the server itself (the built-in "Zabbix server" host), not the Windows PC.
+# INSTALL_AGENT: Zabbix Agent 2 on this server. app/single: it monitors the
+# server itself (the built-in "Zabbix server" host), not the Windows PC.
+# db: it lets the Zabbix server monitor the database server (step 1.6).
 # Default yes. Priority flag > environment > env file > prompt; a re-run
 # without any of them offers the previous choice from the state file.
 ask_install_agent() {
   local def=y q="Install Zabbix Agent 2 on this server (it monitors this server itself, not the Windows PC)?"
   local src=${SRC[INSTALL_AGENT]:-}
-  if [[ $MODE == db ]]; then
-    [[ -n $src ]] && warn "${src}: ignored - db mode never installs an agent"
-    INSTALL_AGENT=""; return 0
-  fi
+  [[ $MODE == db ]] && q="Install Zabbix Agent 2 on this database server so the Zabbix server can monitor it?"
   if [[ -n $src ]]; then
     if v_yesno "$INSTALL_AGENT"; then
-      INSTALL_AGENT=${INSTALL_AGENT,,}; say "  ${q} ${INSTALL_AGENT}   (from ${src})"; return 0
+      INSTALL_AGENT=${INSTALL_AGENT,,}; say "  ${q} ${INSTALL_AGENT}   (from ${src})"
+      ask_agent_hostname; return 0
     fi
     warn "INSTALL_AGENT='${INSTALL_AGENT}' from ${src} is invalid: ${VERR}"
     [[ $ASSUME_YES == true ]] && die "Fix the ${src} value for INSTALL_AGENT and re-run."
   fi
   [[ ${ST_INSTALL_AGENT,,} == no ]] && def=n
   if ask_yn "$q" "$def"; then INSTALL_AGENT=yes; else INSTALL_AGENT=no; fi
+  ask_agent_hostname
+  return 0
+}
+
+# AGENT_HOSTNAME: Hostname= in zabbix_agent2.conf, and the host name to use
+# in the web UI. db: asked, default the short system hostname. app/single:
+# not asked - the package default "Zabbix server" (the built-in host) stays,
+# unless --agent-hostname / ZBX_AGENT_HOSTNAME / an env file sets another.
+ask_agent_hostname() {
+  [[ $INSTALL_AGENT == yes ]] || return 0
+  local def
+  if [[ $MODE == db ]]; then
+    def=${ST_AGENT_HOSTNAME:-$(hostname -s 2>/dev/null || true)}
+    ask AGENT_HOSTNAME "Agent host name (Hostname= in zabbix_agent2.conf, and the host name in the web UI):" "$def" v_agent_host
+    if [[ $AGENT_HOSTNAME == "$ZBX_DEFAULT_AGENT_HOST" ]]; then
+      warn "'${ZBX_DEFAULT_AGENT_HOST}' is the built-in host of the Zabbix server itself - this database server would clash with it. Pick another name (--agent-hostname)."
+    fi
+  elif [[ -n ${SRC[AGENT_HOSTNAME]:-} ]]; then
+    ask AGENT_HOSTNAME "Agent host name (Hostname= in zabbix_agent2.conf):" "$ZBX_DEFAULT_AGENT_HOST" v_agent_host
+  else
+    AGENT_HOSTNAME=${ST_AGENT_HOSTNAME:-$ZBX_DEFAULT_AGENT_HOST}
+  fi
   return 0
 }
 
@@ -1299,8 +1334,9 @@ build_summary() {   # SUMMARY_LINES - shown as text and in the dialog (password 
                   "  Static IP     : ${net}${STATIC_IP:+ (${STATIC_IP}/${PREFIX} via ${GATEWAY:-?} on ${IFACE:-?})}")
   [[ -n $ADD_USER ]] && SUMMARY_LINES+=("  Admin user    : ${ADD_USER}")
   [[ $RESET == true ]] && SUMMARY_LINES+=("  RESET         : database ${DB_NAME} will be DROPPED and recreated")
+  SUMMARY_LINES+=("  Agent 2 on this server: ${INSTALL_AGENT}")
+  if [[ $INSTALL_AGENT == yes ]]; then SUMMARY_LINES+=("  Agent host name: ${AGENT_HOSTNAME}"); fi
   if [[ $MODE != db ]]; then
-    SUMMARY_LINES+=("  Agent 2 on this server: ${INSTALL_AGENT}")
     SUMMARY_LINES+=("  Windows host  : ${WIN_HOSTNAME:-<WIN_HOSTNAME>} / ${WIN_IP:-<WIN_IP>}")
   fi
   [[ -n $ENV_FILE ]] && SUMMARY_LINES+=("  Env file      : ${ENV_FILE}")
@@ -1372,8 +1408,9 @@ preflight() {
   elif ((mem_kb >= MIN_RAM_MB * 1024 * 95 / 100)); then vrow PASS "RAM >= ${MIN_RAM_MB} MB" "$((mem_kb / 1024)) MB"
   else vrow WARN "RAM >= ${MIN_RAM_MB} MB" "$((mem_kb / 1024)) MB - Zabbix may be slow"; fi
 
-  # Zabbix repo (needed for app/single) - catches the 404 from a wrong path
-  if [[ $MODE != db ]]; then
+  # Zabbix repo (needed for app/single, and for db only when the agent is
+  # requested) - catches the 404 from a wrong path
+  if [[ $MODE != db || $INSTALL_AGENT == yes ]]; then
     url=$(zbx_release_url)
     code=$(http_code "$url")
     case $code in
@@ -1434,7 +1471,7 @@ preflight() {
       fi
       ;;
   esac
-  if [[ $MODE != db ]] && pkg_installed zabbix-agent; then
+  if [[ $MODE != db || $INSTALL_AGENT == yes ]] && pkg_installed zabbix-agent; then
     vrow WARN "classic zabbix-agent absent" "installed - it also uses port ${ZBX_AGENT_PORT}" "sudo apt remove zabbix-agent (this setup uses zabbix-agent2)"
   fi
   if [[ $RESET == true && $MODE == app ]]; then
@@ -1749,6 +1786,7 @@ part1_database() {
     info "The real test runs FROM the app server (${APP_IP}), not here:"
     info "    mysql -h ${DB_IP} -P ${DB_PORT} -u ${DB_USER} -p"
     info "app mode does exactly this before it imports the schema."
+    db_install_agent                                        # 1.6 (optional)
   elif [[ $SINGLE_CUSTOM_PORT == true ]]; then
     step 1.5 "Verify the zabbix user can log in over TCP (127.0.0.1:${DB_PORT})"
     _action "\$ mysql -h 127.0.0.1 -P ${DB_PORT} -u ${DB_USER} -p ${DB_NAME} -e 'SELECT 1;'"
@@ -1846,18 +1884,9 @@ reset_database() {
   ok "database ${DB_NAME} dropped - it is recreated empty below"
 }
 
-# =============================================================================
-# 8. Part 2 - App & Web server (app mode; single mode runs it locally)
-# =============================================================================
-part2_app() {
-  part "Part 2 - App & Web server"
-  local db_host=$DB_IP db_port=$DB_PORT
-  # single: socket (DBHost=localhost, no DBPort) or, with a custom port, TCP
-  # to 127.0.0.1 so the port is really used (DBHost=127.0.0.1, DBPort=port)
-  if [[ $MODE == single ]]; then db_host=$(single_db_host); [[ $SINGLE_CUSTOM_PORT == true ]] || db_port=""; fi
-
-  # ---- 2.1 Repository ----------------------------------------------------------
-  step 2.1 "Add the Zabbix ${ZBX_VERSION} repository (Ubuntu ${OS_VER:-$TARGET_UBUNTU})"
+# Zabbix 8.0 repository (the /release/ URL) + apt update. Used by step 2.1,
+# and by step 1.6 when the database server gets Agent 2.
+add_zabbix_repo() {
   local url deb tmpd
   url=$(zbx_release_url); deb=${url##*/}
   if [[ $DRY_RUN != true ]] && grep -rqs "zabbix/${ZBX_VERSION}/release" /etc/apt/sources.list.d/; then
@@ -1876,6 +1905,73 @@ part2_app() {
   run add-apt-repository universe -y
   APT_FRESH=false
   apt_update
+}
+
+# ---- 1.6 Agent 2 on the database server (optional, db mode) ---------------
+# Only zabbix-agent2 - never a server or frontend package on this node.
+# Server=/ServerActive= point at the app server; Hostname= is AGENT_HOSTNAME.
+db_install_agent() {
+  step 1.6 "Install Zabbix Agent 2 on the database server (monitored by ${APP_IP})"
+  if [[ $INSTALL_AGENT != yes ]]; then
+    say "      repository, zabbix-agent2 package, ${ZBX_AGENT_CONF}, service, ufw ${ZBX_AGENT_PORT}/tcp: (skipped: agent not requested)"
+    if [[ $DRY_RUN != true ]] && pkg_installed zabbix-agent2; then info "Agent 2 was already installed; leaving it as it is"; fi
+    return 0
+  fi
+  add_zabbix_repo
+  apt_install "sudo apt install zabbix-agent2 -y   # the agent only: no server or frontend packages here" zabbix-agent2
+  if [[ $DRY_RUN != true && ! -f $ZBX_AGENT_CONF ]]; then die "${ZBX_AGENT_CONF} is missing - did zabbix-agent2 install?"; fi
+  backup_file "$ZBX_AGENT_CONF"
+  edit_kv "$ZBX_AGENT_CONF" "" Server "$APP_IP" plain
+  edit_kv "$ZBX_AGENT_CONF" "" ServerActive "$APP_IP" plain
+  edit_kv "$ZBX_AGENT_CONF" "" Hostname "$AGENT_HOSTNAME" plain
+  run systemctl enable zabbix-agent2
+  run systemctl restart zabbix-agent2
+  _action "\$ systemctl is-active zabbix-agent2; sudo ss -ltn | grep :${ZBX_AGENT_PORT}   # expect active / listening"
+  if [[ $DRY_RUN != true ]]; then
+    svc_active zabbix-agent2 || die "zabbix-agent2 did not start. Check: sudo journalctl -u zabbix-agent2 -n 50"
+    if wait_for_listen "$ZBX_AGENT_PORT" 15; then ok "zabbix-agent2 active, listening on $(listen_addrs "$ZBX_AGENT_PORT")"
+    else warn "zabbix-agent2 is active but not listening on ${ZBX_AGENT_PORT} - check ListenPort in ${ZBX_AGENT_CONF}"; fi
+  fi
+  open_agent_firewall
+}
+
+# ufw for the passive checks from the Zabbix server: only from APP_IP, and
+# only when ufw is already active (never enabled here).
+open_agent_firewall() {
+  local st
+  if [[ $DRY_RUN == true ]]; then
+    _action "\$ sudo ufw allow from ${APP_IP} to any port ${ZBX_AGENT_PORT} proto tcp   # only if ufw is active"
+    return 0
+  fi
+  st=$(ufw_state)
+  _action "\$ sudo ufw status   # -> ${st}"
+  if [[ $st != active ]]; then
+    skip "ufw is ${st} - nothing to open (this script never enables ufw)"
+    FW_SKIPPED+=("${ZBX_AGENT_PORT}/tcp (ufw ${st})")
+  else
+    # the app server's IP changed since the last agent run: drop the old rule
+    if [[ $ST_MODE == db && $ST_INSTALL_AGENT == yes && -n $ST_APP_IP && $ST_APP_IP != "$APP_IP" ]]; then
+      run ufw delete allow from "$ST_APP_IP" to any port "$ZBX_AGENT_PORT" proto tcp || true
+    fi
+    run ufw allow from "$APP_IP" to any port "$ZBX_AGENT_PORT" proto tcp
+    FW_CHANGED+=("allow ${ZBX_AGENT_PORT}/tcp from ${APP_IP}")
+  fi
+  say "      firewall changed: ${FW_CHANGED[*]:-nothing}   skipped: ${FW_SKIPPED[*]:-nothing}"
+}
+
+# =============================================================================
+# 8. Part 2 - App & Web server (app mode; single mode runs it locally)
+# =============================================================================
+part2_app() {
+  part "Part 2 - App & Web server"
+  local db_host=$DB_IP db_port=$DB_PORT
+  # single: socket (DBHost=localhost, no DBPort) or, with a custom port, TCP
+  # to 127.0.0.1 so the port is really used (DBHost=127.0.0.1, DBPort=port)
+  if [[ $MODE == single ]]; then db_host=$(single_db_host); [[ $SINGLE_CUSTOM_PORT == true ]] || db_port=""; fi
+
+  # ---- 2.1 Repository ----------------------------------------------------------
+  step 2.1 "Add the Zabbix ${ZBX_VERSION} repository (Ubuntu ${OS_VER:-$TARGET_UBUNTU})"
+  add_zabbix_repo
 
   # ---- 2.2 Packages --------------------------------------------------------------
   step 2.2 "Install Zabbix packages (agent 2, not the classic agent)"
@@ -1958,6 +2054,7 @@ part2_app() {
   # ---- 2.7 Services --------------------------------------------------------------
   step 2.7 "Start and enable services"
   [[ $DRY_RUN == true ]] || stop_zabbix_server
+  [[ $INSTALL_AGENT == no ]] || set_server_agent_hostname
   local -a svcs=()
   mapfile -t svcs < <(app_services)
   run systemctl restart "${svcs[@]}"
@@ -1979,6 +2076,20 @@ part2_app() {
   # ---- 2.8 / 2.9 Manual ----------------------------------------------------------
   step 2.8 "Complete the frontend web wizard - manual, values in NEXT STEPS"
   step 2.9 "Log into the Zabbix website (Admin / zabbix) - manual, see NEXT STEPS"
+}
+
+# app/single: zabbix_agent2.conf keeps the package's Hostname=Zabbix server
+# (the built-in host). It is only edited when --agent-hostname /
+# ZBX_AGENT_HOSTNAME asks for another name than the one already there.
+set_server_agent_hostname() {
+  local cur=$ZBX_DEFAULT_AGENT_HOST
+  if [[ $DRY_RUN != true ]]; then cur=$(kv_get "$ZBX_AGENT_CONF" "" Hostname || true); fi
+  [[ -n $AGENT_HOSTNAME && $AGENT_HOSTNAME != "$cur" ]] || return 0
+  backup_file "$ZBX_AGENT_CONF"
+  edit_kv "$ZBX_AGENT_CONF" "" Hostname "$AGENT_HOSTNAME" plain
+  if [[ $AGENT_HOSTNAME != "$ZBX_DEFAULT_AGENT_HOST" ]]; then
+    warn "Hostname=${AGENT_HOSTNAME}: rename the built-in '${ZBX_DEFAULT_AGENT_HOST}' host in the web UI to match, or its agent shows as unavailable."
+  fi
 }
 
 # The services of steps 2.7 and --verify; zabbix-agent2 only when installed
@@ -2211,8 +2322,24 @@ ZBX_TIMEZONE='${TIMEZONE}'
 # When the app server has imported the schema, come back to THIS server and run:
 #   sudo ${LAUNCH} --mode db --yes
 #   (it detects the schema and sets log_bin_trust_function_creators back to 0)
-# ###########################################################################
 EOF
+  # Agent 2 on this database server: comment lines only, so loading this file
+  # with --env-file on the app server never sets its own agent host name.
+  if [[ $INSTALL_AGENT == yes ]]; then
+    cat <<EOF
+#
+# ZBX_AGENT_HOSTNAME='${AGENT_HOSTNAME}'   (this DB server's agent - reference only)
+#
+# Add this server in the Zabbix web UI  (Data collection > Hosts > Create host):
+#   Host name    ${AGENT_HOSTNAME}   (identical to Hostname= in ${ZBX_AGENT_CONF})
+#   Host groups  Linux servers
+#   Interfaces   Add > Agent: IP ${DB_IP}, port ${ZBX_AGENT_PORT}
+#   Templates    Linux by Zabbix agent
+EOF
+  else
+    printf '#\n# Agent 2 on this database server: not installed (by choice).\n'
+  fi
+  printf '# ###########################################################################\n'
 }
 
 # zabbix-setup.env: every setting of this run, as an env file (section E).
@@ -2237,7 +2364,8 @@ render_env() {   # render_env PASSWORD_OR_MASK
   _env_kv DB_NAME "$DB_NAME"
   _env_kv DB_USER "$DB_USER"
   _env_kv TIMEZONE "$TIMEZONE"
-  [[ $MODE != db ]] && _env_kv INSTALL_AGENT "$INSTALL_AGENT"
+  _env_kv INSTALL_AGENT "$INSTALL_AGENT"
+  [[ $INSTALL_AGENT == yes ]] && _env_kv AGENT_HOSTNAME "$AGENT_HOSTNAME"
   _env_kv WIN_HOSTNAME "$WIN_HOSTNAME"
   _env_kv WIN_IP "$WIN_IP"
   if [[ $NET_ACTION == configure ]]; then
@@ -2458,7 +2586,26 @@ verify_db() {
   if [[ $remote == "${DB_USER}@${APP_IP}" ]]; then vrow PASS "only remote account is ${DB_USER}@${APP_IP}" ""
   elif [[ -n $extra ]]; then vrow FAIL "only remote account is ${DB_USER}@${APP_IP}" "also: ${extra% }" "remove unused ones: sudo mysql -e \"DROP USER 'name'@'host';\""
   else vrow FAIL "only remote account is ${DB_USER}@${APP_IP}" "none found" "re-run: sudo ${LAUNCH} --mode db"; fi
+  vc_db_agent
   vc_chrony
+}
+
+# Agent 2 on the database server (step 1.6), only when it was requested
+vc_db_agent() {
+  local srv hn
+  if [[ $INSTALL_AGENT != yes ]]; then
+    vrow SKIP "Zabbix Agent 2 on this server" "skipped (not installed by choice)"
+    return 0
+  fi
+  vc_service zabbix-agent2
+  vc_listen "$ZBX_AGENT_PORT" "zabbix-agent2" "sudo systemctl restart zabbix-agent2; check ListenPort in ${ZBX_AGENT_CONF}"
+  srv=$(kv_get "$ZBX_AGENT_CONF" "" Server || true)
+  hn=$(kv_get "$ZBX_AGENT_CONF" "" Hostname || true)
+  if [[ ",${srv// /}," == *",${APP_IP},"* ]]; then vrow PASS "zabbix_agent2.conf Server=${APP_IP}" "Server=${srv}"
+  else vrow FAIL "zabbix_agent2.conf Server=${APP_IP}" "Server=${srv:-<not set>}" "set Server=${APP_IP} in ${ZBX_AGENT_CONF}; sudo systemctl restart zabbix-agent2"; fi
+  if [[ -n $AGENT_HOSTNAME && $hn == "$AGENT_HOSTNAME" ]]; then vrow PASS "zabbix_agent2.conf Hostname=${AGENT_HOSTNAME}" ""
+  else vrow FAIL "zabbix_agent2.conf Hostname=${AGENT_HOSTNAME:-?}" "Hostname=${hn:-<not set>}" "re-run: sudo ${LAUNCH} --mode db --agent-hostname <name>"; fi
+  vc_ufw "$ZBX_AGENT_PORT" "$APP_IP"
 }
 
 verify_app() {
@@ -2601,7 +2748,12 @@ resolve_verify_settings() {
   if [[ $MODE == app && -z $DB_IP ]]; then DB_IP=$(kv_get "$ZBX_SERVER_CONF" "" DBHost || true); fi
   # agent choice: flag/env/env file, else the state file; older state = yes
   if [[ -n $INSTALL_AGENT ]] && ! v_yesno "$INSTALL_AGENT"; then die "INSTALL_AGENT='${INSTALL_AGENT}' from ${SRC[INSTALL_AGENT]:-?}: ${VERR}"; fi
-  INSTALL_AGENT=${INSTALL_AGENT:-${ST_INSTALL_AGENT:-yes}}; INSTALL_AGENT=${INSTALL_AGENT,,}
+  # (db servers set up before 1.2.0 never had an agent: no recorded choice = no)
+  if [[ $MODE == db ]]; then INSTALL_AGENT=${INSTALL_AGENT:-${ST_INSTALL_AGENT:-no}}
+  else INSTALL_AGENT=${INSTALL_AGENT:-${ST_INSTALL_AGENT:-yes}}; fi
+  INSTALL_AGENT=${INSTALL_AGENT,,}
+  if [[ -n $AGENT_HOSTNAME ]] && ! v_agent_host "$AGENT_HOSTNAME"; then die "AGENT_HOSTNAME='${AGENT_HOSTNAME}': ${VERR}"; fi
+  [[ -n $AGENT_HOSTNAME ]] || AGENT_HOSTNAME=${ST_AGENT_HOSTNAME:-$(kv_get "$ZBX_AGENT_CONF" "" Hostname || true)}
   detect_php_fpm >/dev/null
   return 0
 }
@@ -2705,7 +2857,8 @@ main() {
   say ""
   say "  Backups of edited files: ${BACKUP_DIR}$([[ -d $BACKUP_DIR ]] || echo ' (none needed)')"
   say "  Log: ${LOG_FILE}"
-  if [[ $MODE != db ]]; then say "  Agent 2 on this server: ${INSTALL_AGENT}"; fi
+  if [[ $INSTALL_AGENT == yes ]]; then say "  Agent 2 on this server: yes (Hostname=${AGENT_HOSTNAME})"
+  else say "  Agent 2 on this server: no"; fi
   if [[ $MODE == db ]]; then
     emit_secret_block render_handoff "$HANDOFF_FILE"
     git_warning "$DEFAULT_ENV_FILE" "$HANDOFF_FILE"

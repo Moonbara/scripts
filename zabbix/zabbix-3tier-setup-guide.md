@@ -14,6 +14,7 @@ Fill these in for your environment, then swap them into the commands below.
 | `<DB_PORT>` | Port MySQL listens on (non-default) | `8090` |
 | `<DB_PASSWORD>` | Password for the `zabbix` MySQL user | (choose your own, strong) |
 | `<WIN_HOSTNAME>` | Hostname/Host name of the Windows agent | `CapyWin` |
+| `<AGENT_HOSTNAME>` | `Hostname=` of the optional Agent 2 on the DB node (Part 1 step 6); usually its short hostname | `capydb` |
 | `<WIN_IP>` | IP of the Windows 11 machine | `10.4.0.38` |
 
 > Ubuntu 26.04 ships PHP 8.5-FPM by default rather than `mod_php`, which is why this guide's Apache setup differs from a standard 24.04 install (PHP-FPM needs Apache's proxy modules to hand off requests, instead of `php_value` directives in `apache.conf`).
@@ -102,6 +103,35 @@ Before moving to Part 2, test the connection **from the App server** (`<APP_IP>`
 mysql -h <DB_IP> -P <DB_PORT> -u zabbix -p
 ```
 If this connects, everything in Part 1 is solid and any later connection issue is a Zabbix-side config problem, not MySQL. If it refuses to connect, check in this order: MySQL is running (`sudo systemctl status mysql`), `bind-address` is `0.0.0.0` not `127.0.0.1`, `port` in `mysqld.cnf` matches `<DB_PORT>`, and `ufw` (step 3 above) isn't blocking it.
+
+### 6. (Optional) Install Zabbix Agent 2 on the DB node
+This lets the Zabbix server monitor the database server itself. Install **only** the agent here: no server or frontend packages. Use the same repository as Part 2 step 1:
+```bash
+wget https://repo.zabbix.com/zabbix/8.0/release/ubuntu/pool/main/z/zabbix-release/zabbix-release_latest+ubuntu26.04_all.deb
+sudo dpkg -i zabbix-release_latest+ubuntu26.04_all.deb
+sudo apt update
+sudo apt install zabbix-agent2 -y
+```
+```bash
+sudo nano /etc/zabbix/zabbix_agent2.conf
+```
+Change the existing lines (the package ships `Server=127.0.0.1`, `ServerActive=127.0.0.1` and `Hostname=Zabbix server`) rather than adding new ones:
+```ini
+Server=<APP_IP>
+ServerActive=<APP_IP>
+Hostname=<AGENT_HOSTNAME>
+```
+> Do not keep `Hostname=Zabbix server`: that name belongs to the built-in host of the Zabbix server itself, and the two would clash.
+```bash
+sudo systemctl enable zabbix-agent2
+sudo systemctl restart zabbix-agent2
+sudo ufw allow from <APP_IP> to any port 10050 proto tcp    # only if ufw is active
+```
+Once Part 2 is done, add it in the web UI under **Data collection → Hosts → Create host**:
+- Host name: `<AGENT_HOSTNAME>` (must match `Hostname=` exactly)
+- Host groups: `Linux servers`
+- Interfaces: Agent, `<DB_IP>`, port `10050`
+- Templates: **`Linux by Zabbix agent`**
 
 ---
 
@@ -279,7 +309,7 @@ Check **Monitoring → Latest data** filtered to `<WIN_HOSTNAME>` — CPU, memor
 
 ## Automation
 
-[`zabbix-setup.sh`](zabbix-setup.sh) performs Parts 1 and 2 with the same step numbers as this guide (plus Part 0 for preparation, and steps 2.5a / 2.7a). Run it as `sudo ./zabbix-setup.sh`, or with the one-liner from [Run it](#run-it-automation). With no options it shows a menu; on a terminal, prompts are whiptail dialogs (`--no-dialog` for plain text).
+[`zabbix-setup.sh`](zabbix-setup.sh) performs Parts 1 and 2 with the same step numbers as this guide (plus Part 0 for preparation, the optional Part 1 step 6, and steps 2.5a / 2.7a). Run it as `sudo ./zabbix-setup.sh`, or with the one-liner from [Run it](#run-it-automation). With no options it shows a menu; on a terminal, prompts are whiptail dialogs (`--no-dialog` for plain text).
 
 | Scenario | Command |
 |---|---|
@@ -293,6 +323,7 @@ Check **Monitoring → Latest data** filtered to `<WIN_HOSTNAME>` — CPU, memor
 - **`--env-file PATH`** loads `ZBX_*` settings from a file (`ZBX_DB_IP=...`, `ZBX_DB_PORT=...`, `ZBX_DB_PASSWORD='...'`). The DB server's `zabbix-handoff.txt` is such a file: copy it to the app server with `scp` and pass it with `--env-file`. Each run also writes `./zabbix-setup.env` (chmod 600) and reads it back automatically on the next run in the same directory. Priority: flag > `ZBX_*` environment variable > env file > prompt.
 - The env file, `zabbix-handoff.txt` and `zabbix-next-steps.txt` contain the DB password: keep them chmod 600 and out of git.
 - Single VM with a custom MySQL port (`--db-port`): Zabbix then connects over TCP to `127.0.0.1:<port>`, and the wizard's Database host is `127.0.0.1`. `localhost` would make the MySQL client use the socket and ignore the port.
+- Agent 2 is optional in every mode (`--agent` / `--no-agent`, `ZBX_INSTALL_AGENT`, default yes). On the DB server it is Part 1 step 6 (`--agent-hostname`, `ZBX_AGENT_HOSTNAME`, default the short hostname), and the hand-off block lists the host to add in the web UI.
 
 ---
 

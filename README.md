@@ -1,6 +1,6 @@
 # scripts
 
-Small automation scripts and guides from my sysadmin studies and homelab. The main project is [`zabbix/zabbix-setup.sh`](zabbix/zabbix-setup.sh) (version 1.1.1). It sets up the **server side** of Zabbix 8.0 LTS on Ubuntu 26.04, either on one VM or split between a database server and an app/web server. It installs MySQL, the Zabbix server, the Apache + PHP-FPM frontend and Zabbix Agent 2, then checks the result. The Windows 11 agent stays **manual**: the script ends by printing the exact values to type on Windows and in the web UI.
+Small automation scripts and guides from my sysadmin studies and homelab. The main project is [`zabbix/zabbix-setup.sh`](zabbix/zabbix-setup.sh) (version 1.2.0). It sets up the **server side** of Zabbix 8.0 LTS on Ubuntu 26.04, either on one VM or split between a database server and an app/web server. It installs MySQL, the Zabbix server, the Apache + PHP-FPM frontend and (optionally) Zabbix Agent 2 on each server, then checks the result. The Windows 11 agent stays **manual**: the script ends by printing the exact values to type on Windows and in the web UI.
 
 | Folder | What it is |
 |---|---|
@@ -60,14 +60,20 @@ With no options, a menu asks which role the machine has: **1** single VM, **2** 
 | `--add-user NAME` | Create a sudo user and install an SSH public key |
 | `--reset` | Drop and recreate the Zabbix database (db/single only, always asks first) |
 | `--no-dialog` | Plain text prompts instead of whiptail dialogs |
-| `--agent` / `--no-agent` | App/single: install Zabbix Agent 2 on this server, or not (default: yes; see below) |
+| `--agent` / `--no-agent` | Install Zabbix Agent 2 on this server, or not (all modes, default: yes; see below) |
+| `--agent-hostname NAME` | `Hostname=` of that agent, and the host name to use in the web UI |
 | `--force` | Continue on another OS version or a role mismatch |
 | `--yes`, `-y` | Accept every default, no prompts |
 | `--help`, `-h` | Full list, including every value flag |
 
 Values (`--app-ip`, `--db-ip`, `--db-port`, `--db-name`, `--db-user`, `--timezone`, and others) come from, in priority order: a **flag**, a **`ZBX_*` environment variable**, an **env file**, then a **prompt**. There is no password flag on purpose, because it would leak into shell history and `ps`. Pass the password through the hidden prompt, `--db-password-file`, `ZBX_DB_PASSWORD`, or an env file.
 
-**Agent 2 on the server.** In app and single modes the script asks whether to install Zabbix Agent 2 on the server itself (default: yes; key `ZBX_INSTALL_AGENT=yes|no`). That agent only monitors the Zabbix server machine, through the built-in "Zabbix server" host. The Windows PC's agent is a separate, manual install. Answer no and the built-in host shows its agent as unavailable: disable that host or ignore it. A "no" never removes an agent that is already installed. The database server never gets an agent.
+**Agent 2 on the servers.** In every mode the script asks whether to install Zabbix Agent 2 on the machine it runs on. The default is yes; the keys are `ZBX_INSTALL_AGENT=yes|no` and `ZBX_AGENT_HOSTNAME`.
+
+- **App/single:** the agent monitors the Zabbix server machine itself, through the built-in "Zabbix server" host. Its `Hostname=` stays `Zabbix server` unless you pass `--agent-hostname`. Answer no, and that built-in host shows its agent as unavailable: disable it or ignore it.
+- **Database server:** the script adds the Zabbix repository and installs **only** `zabbix-agent2`, never a server or frontend package. It sets `Server=`/`ServerActive=` to the app server and `Hostname=` to the short hostname (or `--agent-hostname`). If `ufw` is active, it opens port 10050 for the app server only. The hand-off block then tells you how to add this server in the web UI ("Linux servers", template "Linux by Zabbix agent").
+
+A "no" never removes an agent that is already installed. The Windows PC's agent is always a separate, manual install.
 
 ## Documentation
 
@@ -86,7 +92,7 @@ These generated files contain the **database password**. They are written with m
 
 **Never commit them.** They are listed in [`.gitignore`](.gitignore), and the script warns when it runs inside a git repository where they are not ignored. The log (`/var/log/zabbix-setup.log`) and `zabbix-manual-steps.txt` never contain the password.
 
-Backups of every edited config file go to `/var/backups/zabbix-setup/<timestamp>/`. The copy of `zabbix_server.conf` there holds the password, so the folder is created with mode `700` and every backed-up file is set to `600`. A run of 1.1.1 also tightens backups left by an older version (`755` folders, `644` files).
+Backups of every edited config file go to `/var/backups/zabbix-setup/<timestamp>/`. The copy of `zabbix_server.conf` there holds the password, so the folder is created with mode `700` and every backed-up file is set to `600`. Since 1.1.1, a run also tightens backups left by an older version (`755` folders, `644` files).
 
 ## Disclaimer
 

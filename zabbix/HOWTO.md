@@ -1,6 +1,6 @@
 # zabbix-setup.sh: how to use it
 
-Step-by-step usage of [`zabbix-setup.sh`](zabbix-setup.sh) version 1.1.1: Zabbix 8.0 LTS server side on Ubuntu 26.04. The manual procedure it automates is in [`zabbix-3tier-setup-guide.md`](zabbix-3tier-setup-guide.md).
+Step-by-step usage of [`zabbix-setup.sh`](zabbix-setup.sh) version 1.2.0: Zabbix 8.0 LTS server side on Ubuntu 26.04. The manual procedure it automates is in [`zabbix-3tier-setup-guide.md`](zabbix-3tier-setup-guide.md).
 
 ## Contents
 
@@ -134,12 +134,13 @@ Follow this exact order:
 sudo ./zabbix-setup.sh --mode db --app-ip <APP_IP>
 ```
 
-It asks for the static IP, the **Database port?** (default `8090`), the database name and user, the password and the timezone. Then it:
+It asks for the static IP, the **Database port?** (default `8090`), the database name and user, the password and the timezone. Then comes **Install Zabbix Agent 2 on this database server so the Zabbix server can monitor it?** (default yes), and with yes, the **Agent host name** (default: the short hostname). Then it:
 
 - installs MySQL
 - sets `bind-address = 0.0.0.0` and `port = <DB_PORT>`
 - opens the port in `ufw`, but only if `ufw` is already active and only from `<APP_IP>`
 - creates the database and the user `'zabbix'@'<APP_IP>'`
+- with the agent (step 1.6): adds the Zabbix repository, installs **only** `zabbix-agent2`, and sets `Server=<APP_IP>`, `ServerActive=<APP_IP>` and `Hostname=<AGENT_HOSTNAME>` in `/etc/zabbix/zabbix_agent2.conf`. It then starts the agent, and if `ufw` is active, opens port `10050` for `<APP_IP>` only.
 
 The verification ends with two expected warnings: the database is still empty, and `log_bin_trust_function_creators` is still `1`. A third WARN about chrony is harmless if time sync has not settled yet. Then it prints the **hand-off** block and saves it as `zabbix-handoff.txt`:
 
@@ -203,6 +204,20 @@ The schema and trust-flag warnings from step 1 are gone now. Delete `zabbix-hand
 
 In the web wizard on `http://<APP_IP>/zabbix`, the Database host is `<DB_IP>`, and the port must be typed as `<DB_PORT>`. **Do not leave it at 0.**
 
+### Step 5: add the database server in the web UI (if it has the agent)
+
+The hand-off block ends with these values, filled in for your setup:
+
+```text
+# Add this server in the Zabbix web UI  (Data collection > Hosts > Create host):
+#   Host name    <AGENT_HOSTNAME>   (identical to Hostname= in /etc/zabbix/zabbix_agent2.conf)
+#   Host groups  Linux servers
+#   Interfaces   Add > Agent: IP <DB_IP>, port 10050
+#   Templates    Linux by Zabbix agent
+```
+
+After a few minutes, *Monitoring > Latest data* shows CPU, memory and disk for the database server. The hand-off file also carries `# ZBX_AGENT_HOSTNAME=...` as a comment, for reference only: the app server never takes it as its own agent name.
+
 ---
 
 ## 5. Using the env file
@@ -223,7 +238,7 @@ ZBX_DB_PASSWORD='<password>'
   - Lines starting with `#` and blank lines are ignored.
   - The file is **parsed, never sourced**: `$variables`, `$(commands)` and escapes are taken literally.
   - An unknown key gives a warning. A duplicated key, a malformed line or an invalid value stops the run and names the line number.
-- **Keys:** `ZBX_MODE`, `ZBX_APP_IP`, `ZBX_DB_IP`, `ZBX_DB_PORT`, `ZBX_DB_NAME`, `ZBX_DB_USER`, `ZBX_DB_PASSWORD`, `ZBX_TIMEZONE`, `ZBX_WIN_HOSTNAME`, `ZBX_WIN_IP`, `ZBX_IFACE`, `ZBX_STATIC_IP`, `ZBX_PREFIX`, `ZBX_GATEWAY`, `ZBX_DNS`, `ZBX_SSH_KEY_FILE`, `ZBX_INSTALL_AGENT` (`yes` or `no`).
+- **Keys:** `ZBX_MODE`, `ZBX_APP_IP`, `ZBX_DB_IP`, `ZBX_DB_PORT`, `ZBX_DB_NAME`, `ZBX_DB_USER`, `ZBX_DB_PASSWORD`, `ZBX_TIMEZONE`, `ZBX_WIN_HOSTNAME`, `ZBX_WIN_IP`, `ZBX_IFACE`, `ZBX_STATIC_IP`, `ZBX_PREFIX`, `ZBX_GATEWAY`, `ZBX_DNS`, `ZBX_SSH_KEY_FILE`, `ZBX_INSTALL_AGENT` (`yes` or `no`), `ZBX_AGENT_HOSTNAME`.
 - **Priority:** flag > `ZBX_*` environment variable > env file > prompt.
 - **Loading:** `--env-file PATH`. Without that flag, `./zabbix-setup.env` is loaded automatically if it exists, and the script says so.
 - **Writing:** every real run (not `--dry-run`) writes `./zabbix-setup.env` with the settings it used, and keeps the previous copy as `zabbix-setup.env.bak`. Add `--no-env-password` to leave the password out.
@@ -325,13 +340,13 @@ The NEXT STEPS block (also in `zabbix-next-steps.txt`) has these steps with your
 - **`--reset`** is the **only destructive option**. It drops and recreates the Zabbix database, on the db or single machine only (app mode refuses).
   - It always asks first, even with `--yes`: a yes/no in dialog mode, then you must **type the database name**.
   - On the db server, stop zabbix-server on the app server first, then re-run app mode to import the schema again. A single VM stops zabbix-server and re-imports on its own.
-- <a id="agent-2-on-the-server"></a>**Agent 2 on the server** (app and single modes):
-  - The script asks whether to install Zabbix Agent 2 on the Zabbix server itself. Default: yes.
-  - That agent only monitors the server machine, through the built-in "Zabbix server" host. It has nothing to do with the Windows PC, whose agent you always install by hand ([section 8](#8-finishing-on-windows-11-manual)).
-  - Choose with `--agent` / `--no-agent`, or `ZBX_INSTALL_AGENT=yes|no` (environment or env file). The choice is saved to `zabbix-setup.env` and `/etc/zabbix-setup.state`, so re-runs and `--verify` remember it.
-  - With **no**: the package is not installed, the service is not touched, and `--verify` shows `SKIP ... skipped (not installed by choice)`. The built-in "Zabbix server" host then shows its agent as unavailable: disable that host or ignore it.
+- <a id="agent-2-on-the-server"></a>**Agent 2 on the servers** (every mode):
+  - The script asks whether to install Zabbix Agent 2 on the machine it runs on. Default: yes.
+  - Choose with `--agent` / `--no-agent`, or `ZBX_INSTALL_AGENT=yes|no` (environment or env file). `--agent-hostname NAME` / `ZBX_AGENT_HOSTNAME` sets its `Hostname=`: letters, digits, `.`, `_` and `-`, no spaces. Both are saved to `zabbix-setup.env` and `/etc/zabbix-setup.state`, so re-runs and `--verify` remember them.
+  - **App/single:** the agent monitors the server machine itself, through the built-in "Zabbix server" host. Its `Hostname=` stays `Zabbix server` (not asked) unless you pass `--agent-hostname`, and then you must rename the built-in host to match. It has nothing to do with the Windows PC, whose agent you always install by hand ([section 8](#8-finishing-on-windows-11-manual)).
+  - **Database server:** the agent lets the Zabbix server monitor the database machine ([Scenario B, step 5](#step-5-add-the-database-server-in-the-web-ui-if-it-has-the-agent)). The host name is asked, with the short hostname as the default. Do not use `Zabbix server`: the script warns, because it would clash with the built-in host.
+  - With **no**: nothing is installed, the repository (db) and the service are not touched, no port is opened, and `--verify` shows `SKIP ... skipped (not installed by choice)`. On app/single, the built-in "Zabbix server" host then shows its agent as unavailable: disable that host or ignore it.
   - A **no** never removes an agent that is already installed. The run says "Agent 2 was already installed; leaving it as it is".
-  - The database server never gets an agent.
 - **`--add-user NAME`** creates a sudo user:
   - It installs an SSH public key, from `--ssh-key-file` or pasted at the prompt, with `~/.ssh` at 700 and `authorized_keys` at 600.
   - It offers to set a password, which `sudo` needs.
@@ -352,6 +367,7 @@ The NEXT STEPS block (also in `zabbix-next-steps.txt`) has these steps with your
 | Host is grey / "unknown", no data | Host name mismatch, firewall, or agent not restarted | Host name must match `Hostname=` exactly; check `zabbix_agent2.log`; `Test-NetConnection <APP_IP> -Port 10051`; restart "Zabbix Agent 2" |
 | Saving the host fails with `Cannot inherit item with key "agent.hostname" of template "Windows by Zabbix agent" to host "<name>", because a host interface of type "Agent" is required.` (as seen on Zabbix 8.0; the wording may differ slightly between versions) | Template linked, but the host has no Agent interface | *Interfaces > Add > Agent*, `<WIN_IP>` port `10050`, then save again |
 | A re-run pauses about 60 s at step 2.7, then `zabbix-server did not stop within 60 s` | Port or DB IP changed. The old process flushes its cache to a database it can no longer reach | Expected: the script kills it and continues. Unsent history is lost |
+| Database server host: agent unavailable | `Hostname=` differs from the host name in the UI, `ufw` blocks 10050, or `Server=` is not `<APP_IP>` | `sudo ./zabbix-setup.sh --verify` on the DB server checks all three. The UI host name must equal `Hostname=` exactly |
 | Built-in "Zabbix server" host: agent unavailable | Installed with `--no-agent` / answered no: there is no agent on the server | Expected. Disable the host (*Data collection > Hosts*), ignore it, or re-run with `--agent` |
 | Wizard: `Locale for language "en_US" is not found` | Locale missing, or PHP-FPM not restarted | `sudo locale-gen en_US.UTF-8 && sudo systemctl restart php8.5-fpm` |
 | Password rejected: `no space at the start or end` | Leading or trailing space (Zabbix trims it in `zabbix_server.conf`) | Remove it; spaces inside are fine |
@@ -371,6 +387,7 @@ The NEXT STEPS block (also in `zabbix-next-steps.txt`) has these steps with your
 | Next steps (app/single) | `./zabbix-next-steps.txt` (600) | **Yes** |
 | Env file and previous copy | `./zabbix-setup.env`, `./zabbix-setup.env.bak` (600) | **Yes**, unless `--no-env-password` |
 | Manual steps (`--dry-run`) | `./zabbix-manual-steps.txt` | No (masked) |
+| Agent 2 config (db with the agent; app/single only with `--agent-hostname`) | `/etc/zabbix/zabbix_agent2.conf` | No |
 | Static IP (only when applied) | `/etc/netplan/99-zabbix-static.yaml` (600) | No |
 
 `./` means the directory you ran the script from. Never commit the files marked **Yes**.

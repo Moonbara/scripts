@@ -3,11 +3,16 @@
 #  zabbix-setup.sh - server-side automation of zabbix-3tier-setup-guide.md
 #  Zabbix 8.0 LTS | Ubuntu 26.04 | MySQL 8 | Apache + PHP 8.5-FPM | Agent 2
 # -----------------------------------------------------------------------------
-#  Copy this same file to every server and run it there with sudo:
+#  Copy this same file to every server and run it there with sudo, or start
+#  it in one line:  sudo bash -c "$(curl -fsSL <SCRIPT_URL>)" _ [options]
 #
 #    menu 1 / --mode single   Zabbix + MySQL on this VM          (Part 1 + 2)
 #    menu 2 / --mode db       two VMs: this is the DATABASE node (Part 1) FIRST
 #    menu 3 / --mode app      two VMs: this is the APP/WEB node  (Part 2) SECOND
+#
+#  Values come from flags, ZBX_* environment variables, an env file
+#  (--env-file, or ./zabbix-setup.env) or prompts - whiptail dialogs on a
+#  terminal, plain text prompts otherwise (--no-dialog).
 #
 #  Part 3 (the Windows 11 agent) is NOT automated. The run ends with a
 #  NEXT STEPS block holding the exact values to type on Windows and in the UI.
@@ -33,7 +38,11 @@ umask 022
 # =============================================================================
 # 0. Constants and defaults - the only place versions, ports and paths live
 # =============================================================================
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.1"
+# Optional: where the script is published. Only used to print the one-line
+# launch command (leave it empty to print <URL> instead). Pin a tag or a
+# commit instead of main for anything you rely on.
+readonly SCRIPT_URL="https://raw.githubusercontent.com/Moonbara/scripts/main/zabbix/zabbix-setup.sh"
 readonly ZBX_VERSION="8.0"
 readonly TARGET_UBUNTU="26.04"
 readonly ZBX_REPO_BASE="https://repo.zabbix.com/zabbix/${ZBX_VERSION}/release/ubuntu"
@@ -83,25 +92,51 @@ readonly OUT_DIR
 readonly HANDOFF_FILE="${OUT_DIR}/zabbix-handoff.txt"
 readonly NEXT_STEPS_FILE="${OUT_DIR}/zabbix-next-steps.txt"
 readonly MANUAL_STEPS_FILE="${OUT_DIR}/zabbix-manual-steps.txt"
+readonly DEFAULT_ENV_FILE="${OUT_DIR}/zabbix-setup.env"
+
+# How to start this script again, for the messages it prints. Run from a file
+# -> ./zabbix-setup.sh; run as  bash -c "$(curl ...)"  there is no file
+# (BASH_SOURCE is empty) -> print the same one-liner. $0 is never used.
+if [[ -n ${BASH_SOURCE[0]:-} ]]; then
+  LAUNCH="./zabbix-setup.sh"
+else
+  LAUNCH="bash -c \"\$(curl -fsSL ${SCRIPT_URL:-<URL>})\" _"
+fi
+readonly LAUNCH
 
 # --- Run options (set by flags) ---------------------------------------------
 DRY_RUN=false; DO_VERIFY=false; RESET=false; FORCE=false; ASSUME_YES=false
 SHOW_HELP=false; ADD_USER=""; PW_FILE=""; ARGS_TEXT=""
+ENV_FILE=""; NO_ENV_PASSWORD=false; APPLY_NETWORK=false; NO_DIALOG=false
+USE_DIALOG=false; RESET_CONFIRMED=false
 
-# --- Inputs: every one can come from a flag, an environment variable or a
-#     prompt (in that priority). SRC[VAR] remembers where a value came from.
+# --- Inputs: every one can come from a flag, a ZBX_* environment variable,
+#     an env file or a prompt (in that priority). SRC[VAR] remembers where a
+#     value came from. Only ZBX_-prefixed names are read from the
+#     environment, so a stray MODE or DNS in a root shell is never picked up.
+#     The internal names (MODE, DB_PORT, ...) stay unprefixed.
 declare -A SRC=()
 readonly -a INPUT_VARS=(MODE APP_IP DB_IP DB_PORT DB_NAME DB_USER TIMEZONE WIN_HOSTNAME WIN_IP
                         IFACE STATIC_IP PREFIX GATEWAY DNS SSH_KEY_FILE)
 for _v in "${INPUT_VARS[@]}"; do
-  if [[ -n ${!_v:-} ]]; then SRC[$_v]="environment"; else printf -v "$_v" '%s' ""; fi
+  _e="ZBX_${_v}"
+  if [[ -n ${!_e:-} ]]; then printf -v "$_v" '%s' "${!_e}"; SRC[$_v]="environment ${_e}"
+  else printf -v "$_v" '%s' ""; fi
 done
-unset _v
-# The password is never a flag. From the environment it is read once and then
-# un-exported so apt, mysql and other children never inherit it.
-PW_ORIGIN=""
-if [[ -n ${DB_PASSWORD:-} ]]; then PW_ORIGIN="environment"; else DB_PASSWORD=""; fi
-export -n DB_PASSWORD 2>/dev/null || true
+unset _v _e
+# The password is never a flag. From the environment (ZBX_DB_PASSWORD, or the
+# deprecated DB_PASSWORD) it is read once and then un-exported, so apt, mysql
+# and other children never inherit it.
+PW_ORIGIN=""; PW_ENV_DEPRECATED=false
+if [[ -n ${ZBX_DB_PASSWORD:-} ]]; then
+  DB_PASSWORD=$ZBX_DB_PASSWORD; PW_ORIGIN="environment ZBX_DB_PASSWORD"
+elif [[ -n ${DB_PASSWORD:-} ]]; then
+  PW_ORIGIN="environment DB_PASSWORD (deprecated)"; PW_ENV_DEPRECATED=true
+else
+  DB_PASSWORD=""
+fi
+export -n DB_PASSWORD ZBX_DB_PASSWORD 2>/dev/null || true
+unset ZBX_DB_PASSWORD
 
 # --- Run state ----------------------------------------------------------------
 NET_ACTION=""            # keep | configure | skip  (step 0.3)
@@ -239,6 +274,8 @@ v_dns() {
   return 0
 }
 v_username() { [[ $1 =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] && return 0; VERR="lowercase letters, digits, _ and - (max 32)"; return 1; }
+v_path()   { [[ -n $1 && $1 != *[[:cntrl:]]* ]] && return 0; VERR="not a usable path"; return 1; }
+normalize_mode() { case ${1,,} in 1) echo single ;; 2) echo db ;; 3) echo app ;; *) echo "${1,,}" ;; esac; }
 TZ_LIST=""
 v_tz() {
   local tz=$1
@@ -268,33 +305,80 @@ v_password() {
   return 0
 }
 
+# --- whiptail dialogs (used on a terminal; text prompts otherwise) ----------
+# dialog_possible: whiptail installed, stdin/stdout are a terminal, TERM can
+# draw, /dev/tty is usable. --no-dialog and --yes switch dialogs off.
+dialog_possible() {
+  command -v whiptail >/dev/null 2>&1 || return 1
+  [[ -t 0 && -t 1 ]] || return 1
+  [[ -n ${TERM:-} && $TERM != dumb ]] || return 1
+  { : >/dev/tty; } 2>/dev/null
+}
+DLG_ERR=""       # error to show at the top of the next dialog (bad input)
+# _dlg ARGS... - the dialog is drawn on /dev/tty, its answer comes back on
+# stdout (whiptail writes it to stderr: fd 3 keeps the caller's stdout, the
+# screen goes to /dev/tty, stderr goes to fd 3). Answers, passwords
+# included, are never passed as arguments.
+_dlg() { whiptail --backtitle "zabbix-setup.sh ${SCRIPT_VERSION} - Zabbix ${ZBX_VERSION} LTS" "$@" 3>&1 1>/dev/tty 2>&3 3>&-; }
+_dlg_text() {    # _dlg_text "message" -> message with a pending error on top
+  local t=$1
+  if [[ -n $DLG_ERR ]]; then t="Invalid input: ${DLG_ERR}"$'\n\n'"${t}"; DLG_ERR=""; fi
+  printf '%s' "$t"
+}
+end_dialogs() {  # back to the normal terminal for the progress output
+  if [[ $USE_DIALOG == true ]]; then clear 2>/dev/null || printf '\n'; fi
+  return 0
+}
+
 # ask VAR "Question" "default" validator
-# Priority: flag > environment > prompt. --yes takes the default.
+# Priority: flag > environment > env file > prompt. --yes takes the default.
+# --dry-run --yes without a usable default uses a placeholder (<VAR>).
 ask() {
-  local var=$1 q=$2 def=$3 vfn=$4 cur=${!1:-} src=${SRC[$1]:-} ans hint
+  local var=$1 q=$2 def=$3 vfn=$4 cur=${!1:-} src=${SRC[$1]:-} ans hint rc
   if [[ -n $src ]]; then
     if "$vfn" "$cur"; then say "  ${q} ${cur}   (from ${src})"; return 0; fi
     warn "${var}='${cur}' from ${src} is invalid: ${VERR}"
     [[ $ASSUME_YES == true ]] && die "Fix the ${src} value for ${var} and re-run."
+    if [[ $USE_DIALOG == true ]]; then DLG_ERR="${var} from ${src}: ${VERR}"; fi
   elif [[ $ASSUME_YES == true ]]; then
     if "$vfn" "$def"; then printf -v "$var" '%s' "$def"; say "  ${q} ${def:-<blank>}   (default, --yes)"; return 0; fi
-    die "${q} has no usable default (${VERR}). Pass it as a flag or environment variable (see --help)."
+    if [[ $DRY_RUN == true ]]; then
+      printf -v "$var" '<%s>' "$var"; say "  ${q} <${var}>   (placeholder: no value given, --dry-run --yes)"; return 0
+    fi
+    die "${q} has no usable default (${VERR}). Pass it as a flag, a ZBX_${var} variable or in an env file (see --help)."
   fi
   if [[ -n $def ]]; then hint="[${def}]"; else hint="(Enter = leave blank)"; fi
   while true; do
-    IFS= read -r -p "  ${q} ${hint}: " ans || die "Input ended while asking: ${q}"
+    if [[ $USE_DIALOG == true ]]; then
+      rc=0
+      ans=$(_dlg --title "Settings (${MODE:-setup})" --inputbox "$(_dlg_text "${q}")" 12 76 "$def") || rc=$?
+      ((rc == 0)) || die "Cancelled at '${q}' - nothing was changed."
+    else
+      IFS= read -r -p "  ${q} ${hint}: " ans || die "Input ended while asking: ${q}"
+    fi
     ans=${ans#"${ans%%[![:space:]]*}"}; ans=${ans%"${ans##*[![:space:]]}"}
     ans=${ans:-$def}
     if "$vfn" "$ans"; then printf -v "$var" '%s' "$ans"; _record "  ${q} ${ans}"; return 0; fi
-    warn "${VERR} - try again."
+    if [[ $USE_DIALOG == true ]]; then DLG_ERR=$VERR; else warn "${VERR} - try again."; fi
   done
 }
 
-# ask_yn "Question" y|n  -> 0 for yes. --yes answers with the default.
+# ask_yn "Question" y|n ["extra text for the dialog"] -> 0 for yes.
+# --yes answers with the default.
 ask_yn() {
-  local q=$1 def=$2 ans hint="[y/N]"
+  local q=$1 def=$2 extra=${3:-} ans hint="[y/N]" text
+  local -a dopt=()
   [[ $def == y ]] && hint="[Y/n]"
   if [[ $ASSUME_YES == true ]]; then say "  ${q} ${hint} ${def}   (default, --yes)"; [[ $def == y ]]; return; fi
+  if [[ $USE_DIALOG == true ]]; then
+    [[ $def == y ]] || dopt=(--defaultno)
+    text=$q
+    if [[ -n $extra ]]; then text="${extra}"$'\n\n'"${q}"; fi
+    if _dlg --title "Question" "${dopt[@]}" --yesno "$text" 16 76; then
+      _record "  ${q} -> yes"; return 0
+    fi
+    _record "  ${q} -> no"; return 1
+  fi
   while true; do
     read -r -p "  ${q} ${hint} " ans || die "Input ended while asking: ${q}"
     ans=${ans:-$def}
@@ -307,9 +391,18 @@ ask_yn() {
 }
 
 read_hidden() {   # read_hidden VAR "prompt" - no echo, never logged
-  local __v
-  IFS= read -r -s -p "$2" __v || die "Input ended while reading a password."
-  printf '\n' >&2
+  local __v __rc=0 __p=$2
+  if [[ $USE_DIALOG == true ]]; then
+    __p=${__p#"${__p%%[![:space:]]*}"}
+    # passwordbox: the typed text comes back through the fd swap in _dlg,
+    # never as an argument, so it is not visible in ps or the log.
+    __v=$(_dlg --title "Database password" --passwordbox "$(_dlg_text "$__p")" 12 76) || __rc=$?
+    ((__rc == 0)) || die "Cancelled at the password - nothing was changed."
+  else
+    if [[ -n $DLG_ERR ]]; then DLG_ERR=""; fi
+    IFS= read -r -s -p "$__p" __v || die "Input ended while reading a password."
+    printf '\n' >&2
+  fi
   printf -v "$1" '%s' "$__v"
 }
 
@@ -319,17 +412,27 @@ read_hidden() {   # read_hidden VAR "prompt" - no echo, never logged
 # =============================================================================
 
 # backup_file PATH - cp -a into /var/backups/zabbix-setup/<timestamp>/<PATH>
+# Backups can hold the DB password (zabbix_server.conf), so the backup root
+# is mode 700 and every copy is mode 600.
 backup_file() {
   local f=$1 dest="${BACKUP_DIR}$1"
   if [[ $DRY_RUN != true ]]; then
     [[ -e $f ]] || return 0
     [[ -e $dest ]] && return 0        # already backed up during this run
   fi
-  _action "\$ sudo mkdir -p ${dest%/*} && sudo cp -a ${f} ${dest}"
+  _action "\$ sudo install -d -m 700 ${BACKUP_ROOT} && sudo mkdir -p ${dest%/*} && sudo cp -a ${f} ${dest} && sudo chmod 600 ${dest}"
   if [[ $DRY_RUN == true ]]; then return 0; fi
-  mkdir -p "${dest%/*}"
+  backup_root_private
+  (umask 077 && mkdir -p "${dest%/*}")
   cp -a -- "$f" "$dest"
+  chmod 600 "$dest"
   info "backup: ${dest}"
+}
+# /var/backups/zabbix-setup at 700. Also tightens what an older version left
+# (755 folders, 644/640 copies): group/other lose every permission.
+backup_root_private() {
+  install -d -m 700 "$BACKUP_ROOT"
+  chmod -R go-rwx "$BACKUP_ROOT"
 }
 
 # Rewrite FILE with the given lines while keeping its inode, owner and mode.
@@ -550,7 +653,12 @@ wait_for_listen() {
   done
   return 1
 }
-tcp_open() { timeout 3 bash -c "</dev/tcp/$1/$2" 2>/dev/null; }
+# Only validated values reach the bash -c string (a --dry-run placeholder such
+# as <DB_IP> would otherwise be parsed as redirections).
+tcp_open() {
+  if ! v_ip "$1" || ! v_port "$2"; then return 1; fi
+  timeout 3 bash -c "</dev/tcp/$1/$2" 2>/dev/null
+}
 
 http_code() {     # http_code URL -> 200, 404, ... or 000
   local code=""
@@ -588,6 +696,10 @@ make_cnf() {
   chmod 600 "$CNF"
   printf '[client]\nuser="%s"\npassword="%s"\n' "$(cnf_escape "$1")" "$(cnf_escape "$2")" >"$CNF"
 }
+# Where Zabbix reaches MySQL in single mode: the local socket by default, or
+# TCP to 127.0.0.1 with a custom port ("localhost" would always mean the
+# socket to the MySQL client library, and the port would be ignored).
+single_db_host() { if [[ $SINGLE_CUSTOM_PORT == true ]]; then printf '127.0.0.1'; else printf 'localhost'; fi; }
 # set_db_target HOST PORT -> DBC_ARGS (socket for localhost, TCP otherwise)
 set_db_target() {
   if [[ -z $1 || $1 == localhost ]]; then
@@ -640,7 +752,7 @@ explain_mysql_error() {
   local out=$1
   case $out in
     *"ERROR 1045"*) printf '%s' "Access denied: wrong password, or the DB user was created for a different IP than this machine (${APP_IP:-?}). Compare with the DB server's hand-off block." ;;
-    *"ERROR 1130"*) printf '%s' "Host not allowed: the MySQL user is scoped to another IP. On the DB server re-run: sudo ./zabbix-setup.sh --mode db --app-ip ${APP_IP:-<this IP>}" ;;
+    *"ERROR 1130"*) printf '%s' "Host not allowed: the MySQL user is scoped to another IP. On the DB server re-run: sudo ${LAUNCH} --mode db --app-ip ${APP_IP:-<this IP>}" ;;
     *"ERROR 1049"*) printf '%s' "Unknown database '${DB_NAME}': db mode has not finished on the DB server (or --db-name differs)." ;;
     *"ERROR 2003"*|*"ERROR 2002"*) printf '%s' "Connection refused (ERROR 2003): MySQL not running, bind-address still 127.0.0.1, port mismatch (mysqld.cnf port vs ${DB_PORT:-?}), or ufw on the DB server." ;;
     *"ERROR 2005"*) printf '%s' "Unknown host: check the DB server IP." ;;
@@ -657,47 +769,77 @@ usage() {
 zabbix-setup.sh ${SCRIPT_VERSION} - Zabbix ${ZBX_VERSION} LTS server setup for Ubuntu ${TARGET_UBUNTU}
 
 Usage: sudo ./zabbix-setup.sh [options]
+   or: sudo bash -c "\$(curl -fsSL ${SCRIPT_URL:-<URL>})" _ [options]
 
-With no options a menu asks which role this machine has:
+With no options a menu asks which role this machine has (whiptail dialogs on
+a terminal, plain text prompts otherwise):
   1) single   Zabbix + MySQL on this VM
   2) db       two VMs - this machine is the DATABASE server  (run it first)
   3) app      two VMs - this machine is the APP/WEB server   (run it second)
+Output files (hand-off, env file, next steps, manual steps) go to the
+current directory.
 
 Actions
   --mode single|db|app   skip the menu
   --dry-run              print every command and file edit (numbered like the guide),
                          change nothing, save the list to ./zabbix-manual-steps.txt
+                         (no password is needed or asked)
   --verify               health check (PASS/WARN/FAIL table, exit 1 on any FAIL)
   --add-user NAME        create sudo user NAME and install an SSH public key
                          (alone: only that; with --mode: done as step 0.2)
   --reset                DROP and recreate the Zabbix database (db/single only, asks first)
+  --apply-network        let step 0.3 apply the static IP (always with netplan try).
+                         Without it, --yes only prints the netplan YAML.
+  --env-file PATH        load ZBX_* values from PATH (default: ./zabbix-setup.env if present)
+  --no-env-password      leave ZBX_DB_PASSWORD out of the ./zabbix-setup.env written at the end
+  --no-dialog            plain text prompts instead of whiptail dialogs
   --force                continue on a non-${TARGET_UBUNTU} OS or a role mismatch
   --yes, -y              accept every default, never prompt
   --help, -h             this text
 
-Values  (priority: flag > environment variable > prompt)
-  --app-ip IP            APP_IP        db: app server allowed to connect
-                                       app/single: this machine (detected)
-  --db-ip IP             DB_IP         app: the database server
-  --db-port PORT         DB_PORT       default ${DEFAULT_DB_PORT} (1024-65535)
-  --db-name NAME         DB_NAME       default ${DEFAULT_DB_NAME}
-  --db-user NAME         DB_USER       default ${DEFAULT_DB_USER}
-  --db-password-file F   file holding the DB password (first line, or a
-                         DB_PASSWORD= line, so the hand-off file works as is)
-                         DB_PASSWORD   env var:  sudo --preserve-env=DB_PASSWORD ...
-  --timezone TZ          TIMEZONE      default ${DEFAULT_TIMEZONE}
-  --win-hostname NAME    WIN_HOSTNAME  only used in the printed Windows steps
-  --win-ip IP            WIN_IP        only used in the printed Windows steps
+Values  (priority: flag > environment variable > env file > prompt)
+  --app-ip IP            ZBX_APP_IP        db: app server allowed to connect
+                                           app/single: this machine (detected)
+  --db-ip IP             ZBX_DB_IP         app: the database server
+  --db-port PORT         ZBX_DB_PORT       default ${DEFAULT_DB_PORT} (1024-65535); single mode:
+                                           a custom port makes Zabbix use TCP to 127.0.0.1
+  --db-name NAME         ZBX_DB_NAME       default ${DEFAULT_DB_NAME}
+  --db-user NAME         ZBX_DB_USER       default ${DEFAULT_DB_USER}
+  --db-password-file F   file holding the DB password: its first line, or a
+                         ZBX_DB_PASSWORD= (or old DB_PASSWORD=) line - the hand-off works as is
+                         ZBX_DB_PASSWORD   env var: sudo --preserve-env=ZBX_DB_PASSWORD ...
+                                           (DB_PASSWORD still works but is deprecated)
+  --timezone TZ          ZBX_TIMEZONE      default ${DEFAULT_TIMEZONE}
+  --win-hostname NAME    ZBX_WIN_HOSTNAME  only used in the printed Windows steps
+  --win-ip IP            ZBX_WIN_IP        only used in the printed Windows steps
   --iface IF  --static-ip IP  --prefix N  --gateway IP  --dns IP[,IP]
-                         IFACE STATIC_IP PREFIX GATEWAY DNS   (static IP, step 0.3)
-  --ssh-key-file F       SSH_KEY_FILE  public key for --add-user
+                         ZBX_IFACE ZBX_STATIC_IP ZBX_PREFIX ZBX_GATEWAY ZBX_DNS  (step 0.3)
+                         --static-ip selects "configure" without asking; values not
+                         given are detected. Applying still needs a yes or --apply-network.
+  --mode                 ZBX_MODE
+  --ssh-key-file F       ZBX_SSH_KEY_FILE  public key for --add-user
 
 There is no --db-password flag on purpose: it would leak into shell history and ps.
+
+Env file
+  Lines of the form ZBX_NAME=value (optional 'export ', optional '...' or "..."
+  around the value), # comment lines and blank lines. It is parsed line by
+  line and never sourced: no \$variables, no \$(commands), no escapes. Unknown
+  keys are ignored with a warning, a duplicated key stops the run. Every real
+  run writes ./zabbix-setup.env with the settings it used (old copy: .bak).
+  The db hand-off (zabbix-handoff.txt) is an env file too. Example:
+      # zabbix-setup.env
+      ZBX_MODE=app
+      ZBX_APP_IP=<APP_IP>
+      ZBX_DB_IP=<DB_IP>
+      ZBX_DB_PORT=${DEFAULT_DB_PORT}
+      ZBX_DB_PASSWORD='<password>'
+  It can hold the password: keep it chmod 600 and out of git.
 
 Examples
   sudo ./zabbix-setup.sh                                   # menu
   sudo ./zabbix-setup.sh --mode db --app-ip <APP_IP>
-  sudo ./zabbix-setup.sh --mode app --db-ip <DB_IP> --db-port <DB_PORT>
+  sudo ./zabbix-setup.sh --mode app --env-file ./zabbix-handoff.txt
   sudo ./zabbix-setup.sh --mode single --dry-run
   sudo ./zabbix-setup.sh --verify
 EOF
@@ -728,6 +870,10 @@ parse_args() {
       --ssh-key-file)     _setv SSH_KEY_FILE "$@"; shift 2 ;;
       --db-password-file) _need "$@"; PW_FILE=$2; shift 2 ;;
       --add-user)         _need "$@"; ADD_USER=$2; shift 2 ;;
+      --env-file)         _need "$@"; ENV_FILE=$2; shift 2 ;;
+      --no-env-password)  NO_ENV_PASSWORD=true; shift ;;
+      --apply-network)    APPLY_NETWORK=true; shift ;;
+      --no-dialog)        NO_DIALOG=true; shift ;;
       --dry-run)          DRY_RUN=true; shift ;;
       --verify)           DO_VERIFY=true; shift ;;
       --reset)            RESET=true; shift ;;
@@ -736,12 +882,81 @@ parse_args() {
       --help|-h)          SHOW_HELP=true; shift ;;
       --db-password|--password|--db-pass|--pw)
         die "There is deliberately no password flag (shell history, ps)." \
-            "Use --db-password-file PATH, the DB_PASSWORD environment variable, or the hidden prompt." ;;
+            "Use --db-password-file PATH, the ZBX_DB_PASSWORD environment variable, an env file, or the hidden prompt." ;;
       *) die "Unknown option: $1 (see --help)" ;;
     esac
   done
-  case ${MODE,,} in 1) MODE=single ;; 2) MODE=db ;; 3) MODE=app ;; *) MODE=${MODE,,} ;; esac
+  MODE=$(normalize_mode "$MODE")
   return 0
+}
+
+# --- Env file (--env-file, or ./zabbix-setup.env): parsed, NEVER sourced ----
+# Accepted: ZBX_NAME=value, optional "export ", optional '...' or "..." around
+# the value (only that outer pair is removed - no escapes, no expansion), #
+# comment lines, blank lines. Anything else stops the run with the line number.
+declare -rA ENV_VALIDATORS=(
+  [MODE]=v_mode [APP_IP]=v_ip [DB_IP]=v_ip [DB_PORT]=v_port [DB_NAME]=v_dbname
+  [DB_USER]=v_dbuser [TIMEZONE]=v_tz [WIN_HOSTNAME]=v_winhost [WIN_IP]=v_ip_opt
+  [IFACE]=v_iface [STATIC_IP]=v_ip [PREFIX]=v_prefix [GATEWAY]=v_ip [DNS]=v_dns
+  [SSH_KEY_FILE]=v_path [DB_PASSWORD]=v_password
+)
+_env_unquote() {   # _env_unquote RAW -> REPLY (outer quotes off, literal)
+  local v=$1 q
+  if ((${#v} >= 2)); then
+    q=${v:0:1}
+    if [[ ($q == '"' || $q == "'") && ${v: -1} == "$q" ]]; then REPLY=${v:1:${#v}-2}; return 0; fi
+  fi
+  v=${v#"${v%%[![:space:]]*}"}; v=${v%"${v##*[![:space:]]}"}
+  REPLY=$v
+}
+_mode_warn() {     # _mode_warn FILE - warn when group/other can read it
+  local mode
+  mode=$(stat -c '%a' "$1" 2>/dev/null || echo 600)
+  if [[ $mode =~ [1-7]$ || $mode =~ [1-7].$ ]]; then
+    warn "$1 is readable by other users (mode ${mode}) and may hold the DB password - chmod 600 it."
+  fi
+  return 0
+}
+load_env_file() {  # load_env_file PATH - fills only values no flag/env var set
+  local f=$1 line n=0 key name val
+  local -A seen=()
+  local re='^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$' re_skip='^[[:space:]]*(#.*)?$'
+  [[ -r $f ]] || die "Cannot read env file ${f}"
+  _mode_warn "$f"
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    line=${line%$'\r'}
+    [[ $line =~ $re_skip ]] && continue
+    [[ $line =~ $re ]] || die "${f} line ${n}: not a ZBX_NAME=value line (only those, # comments and blank lines are allowed)."
+    key=${BASH_REMATCH[2]}
+    _env_unquote "${BASH_REMATCH[3]}"; val=$REPLY
+    if [[ -n ${seen[$key]:-} ]]; then die "${f} line ${n}: duplicate key ${key} (already set on line ${seen[$key]}) - keep only one."; fi
+    seen[$key]=$n
+    name=${key#ZBX_}
+    if [[ $key != ZBX_?* || -z ${ENV_VALIDATORS[$name]:-} ]]; then warn "${f} line ${n}: unknown key ${key} - ignored"; continue; fi
+    [[ -n $val ]] || continue
+    [[ $name == MODE ]] && val=$(normalize_mode "$val")
+    "${ENV_VALIDATORS[$name]}" "$val" || die "${f} line ${n}: ${key} is invalid: ${VERR}"
+    if [[ $name == DB_PASSWORD ]]; then
+      # never printed or logged; a flag (--db-password-file) or env var wins
+      if [[ -z $PW_ORIGIN && -z $PW_FILE ]]; then DB_PASSWORD=$val; PW_ORIGIN="env file ${f}"; fi
+      continue
+    fi
+    if [[ -z ${SRC[$name]:-} ]]; then printf -v "$name" '%s' "$val"; SRC[$name]="env file ${f}"; fi
+  done <"$f"
+  return 0
+}
+pick_env_file() {  # --env-file, or ./zabbix-setup.env when it exists
+  if [[ -n $ENV_FILE ]]; then
+    say "Loading settings from env file ${ENV_FILE} (--env-file)"
+  elif [[ -f $DEFAULT_ENV_FILE ]]; then
+    ENV_FILE=$DEFAULT_ENV_FILE
+    say "Loading settings from ${ENV_FILE} (found in the current directory; --env-file picks another)"
+  else
+    return 0
+  fi
+  load_env_file "$ENV_FILE"
+  MODE=$(normalize_mode "$MODE")
 }
 
 # --- State file: non-secret settings of the last successful run -------------
@@ -771,8 +986,18 @@ write_state() {
 
 choose_mode() {
   if [[ -n $MODE ]]; then v_mode "$MODE" || die "--mode: ${VERR}"; return 0; fi
-  [[ $ASSUME_YES == true ]] && die "--yes needs --mode single|db|app"
-  local c
+  [[ $ASSUME_YES == true ]] && die "--yes needs --mode single|db|app (or ZBX_MODE)"
+  local c rc=0
+  if [[ $USE_DIALOG == true ]]; then
+    c=$(_dlg --title "Scenario" --menu "Which scenario?" 14 76 3 \
+          1 "Single VM (Zabbix + MySQL on the same machine)" \
+          2 "Two VMs: this machine is the DATABASE server" \
+          3 "Two VMs: this machine is the APP/WEB server") || rc=$?
+    ((rc == 0)) || die "Cancelled - nothing was changed."
+    MODE=$(normalize_mode "$c")
+    _record "Scenario chosen: ${MODE}"
+    return 0
+  fi
   say ""
   say "Which scenario?"
   say "  1) Single VM (Zabbix + MySQL on the same machine)"
@@ -788,75 +1013,116 @@ choose_mode() {
 
 # Step 0.3 questions (asked up front; applied after preflight)
 static_ip_prompt() {
-  local def=n dyn
+  local def=n dyn netline dhcp_warn
   net_detect
   case $DET_DYNAMIC in yes) dyn="DHCP lease" ;; no) dyn="not from DHCP" ;; *) dyn="unknown" ;; esac
+  netline="Network now: interface ${DET_IFACE:-?}, address ${DET_IP:-?}/${DET_PREFIX:-?}, gateway ${DET_GW:-?}, DNS ${DET_DNS:-?} (${dyn})"
+  dhcp_warn="A DHCP address can change on reboot or lease renewal. That silently breaks the MySQL user (tied to the app IP) and the Windows agent (Server=/ServerActive=)."
   say ""
-  say "  Network now: interface ${DET_IFACE:-?}, address ${DET_IP:-?}/${DET_PREFIX:-?}, gateway ${DET_GW:-?}, DNS ${DET_DNS:-?} (${dyn})"
+  say "  ${netline}"
   say "  (The Windows agent needs a stable address for the app server, and the MySQL user is tied to the app server's IP.)"
+  # --static-ip / ZBX_STATIC_IP given: take the "configure" branch without
+  # asking; values not given are detected. Applying is decided in step 0.3.
+  if [[ -n ${SRC[STATIC_IP]:-} ]]; then
+    _static_values auto
+    return 0
+  fi
   [[ $DET_DYNAMIC == no ]] && def=y
-  [[ -n ${SRC[STATIC_IP]:-} ]] && def=n
-  if ask_yn "Does this server already have a static IP?" "$def"; then
+  if ask_yn "Does this server already have a static IP?" "$def" "$netline"; then
     if [[ -n $DET_IP ]] && ask_yn "Use ${DET_IP}/${DET_PREFIX} on ${DET_IFACE} (gateway ${DET_GW:-none}) as this server's address?" y; then
       NET_ACTION=keep; HOST_IP=$DET_IP
       IFACE=$DET_IFACE; STATIC_IP=$DET_IP; PREFIX=$DET_PREFIX; GATEWAY=$DET_GW; DNS=$DET_DNS
       return 0
     fi
   fi
-  warn "A DHCP address can change on reboot or lease renewal. That silently breaks the MySQL user (tied to the app IP) and the Windows agent (Server=/ServerActive=)."
-  if ask_yn "Configure a static IP now with netplan? (n = skip and continue)" n; then
-    ask IFACE     "Interface:"                      "$DET_IFACE"             v_iface
-    ask STATIC_IP "Static IP:"                      "$DET_IP"                v_ip
-    ask PREFIX    "Prefix length:"                  "${DET_PREFIX:-24}"      v_prefix
-    ask GATEWAY   "Gateway:"                        "$DET_GW"                v_ip
-    ask DNS       "DNS server(s), comma-separated:" "${DET_DNS:-$GATEWAY}"   v_dns
-    DNS=${DNS// /,}
-    NET_ACTION=configure; HOST_IP=$STATIC_IP
+  warn "$dhcp_warn"
+  if ask_yn "Configure a static IP now with netplan? (n = skip and continue)" n "$dhcp_warn"; then
+    _static_values prompt
   else
     NET_ACTION=skip; HOST_IP=$DET_IP
   fi
+}
+# _static_values prompt|auto - collect IFACE/STATIC_IP/PREFIX/GATEWAY/DNS.
+# auto: a value with no flag/env/env-file source takes the detected one
+# without a question (it is shown as "from detected").
+_static_values() {
+  local how=$1
+  _static_one IFACE     "Interface:"                      "$DET_IFACE"           v_iface  "$how"
+  _static_one STATIC_IP "Static IP:"                      "$DET_IP"              v_ip     "$how"
+  _static_one PREFIX    "Prefix length:"                  "${DET_PREFIX:-24}"    v_prefix "$how"
+  _static_one GATEWAY   "Gateway:"                        "$DET_GW"              v_ip     "$how"
+  _static_one DNS       "DNS server(s), comma-separated:" "${DET_DNS:-$GATEWAY}" v_dns    "$how"
+  DNS=${DNS// /,}
+  NET_ACTION=configure; HOST_IP=$STATIC_IP
+  # --yes never applies a network change without --apply-network, so the
+  # address this server keeps is the current one.
+  if [[ $ASSUME_YES == true && $APPLY_NETWORK != true && -n $DET_IP ]]; then HOST_IP=$DET_IP; fi
+  return 0
+}
+_static_one() {   # _static_one VAR "Question" DEFAULT VALIDATOR prompt|auto
+  if [[ $5 == auto && -z ${SRC[$1]:-} ]] && "$4" "$3"; then
+    printf -v "$1" '%s' "$3"; SRC[$1]="detected"
+  fi
+  ask "$1" "$2" "$3" "$4"
 }
 
 probe_existing_user() {   # re-run detection (real runs only)
   USER_EXISTS=false
   [[ $DRY_RUN == true || $MODE == app ]] && return 0
   command -v mysql >/dev/null 2>&1 && svc_active mysql || return 0
-  local host n
+  local host n other
   if [[ $MODE == single ]]; then host=localhost; else host=$APP_IP; fi
-  n=$(mysql_root -e "SELECT COUNT(*) FROM mysql.user WHERE user='${DB_USER}' AND host IN ('${host}','${ST_APP_IP:-$host}')" 2>/dev/null) || n=0
+  other=${ST_APP_IP:-$host}
+  [[ $MODE == single && $SINGLE_CUSTOM_PORT == true ]] && other=127.0.0.1
+  n=$(mysql_root -e "SELECT COUNT(*) FROM mysql.user WHERE user='${DB_USER}' AND host IN ('${host}','${other}')" 2>/dev/null) || n=0
   [[ $n != 0 ]] && USER_EXISTS=true
   return 0
 }
 
-read_password_file() {
-  local f=$1 line first="" pw="" marker=false mode
-  [[ -r $f ]] || die "Cannot read --db-password-file ${f}"
-  mode=$(stat -c '%a' "$f" 2>/dev/null || echo 600)
-  [[ $mode =~ [1-7]$ || $mode =~ [1-7].$ ]] && warn "${f} is readable by other users - chmod 600 it."
+# _pw_from_file FILE -> REPLY = the password in a hand-off/env file: a
+# ZBX_DB_PASSWORD= line (current format, quotes removed) or a DB_PASSWORD=
+# line (hand-off files of version 1.0, raw). PW_MARKER=true for a hand-off.
+PW_MARKER=false; PW_FIRST=""
+_pw_from_file() {
+  local line first="" re='^[[:space:]]*(export[[:space:]]+)?ZBX_DB_PASSWORD=(.*)$'
+  REPLY=""; PW_MARKER=false; PW_FIRST=""
   while IFS= read -r line || [[ -n $line ]]; do
     line=${line%$'\r'}
-    [[ $line == *"zabbix-setup hand-off"* ]] && marker=true
-    if [[ $line == DB_PASSWORD=* ]]; then pw=${line#DB_PASSWORD=}; break; fi
+    [[ $line == *"zabbix-setup hand-off"* ]] && PW_MARKER=true
+    if [[ $line =~ $re ]]; then _env_unquote "${BASH_REMATCH[2]}"; return 0; fi
+    if [[ $line == DB_PASSWORD=* ]]; then REPLY=${line#DB_PASSWORD=}; return 0; fi
     if [[ -z $first && -n $line ]]; then first=$line; fi
-  done <"$f"
-  if [[ -z $pw ]]; then
-    [[ $marker == true ]] && die "${f} is a hand-off file without a DB_PASSWORD= line (password was kept on a re-run). Use the earlier hand-off file or type the password."
-    pw=$first
-  fi
-  DB_PASSWORD=$pw
+  done <"$1"
+  PW_FIRST=$first
+  return 0
 }
 
-previous_handoff_password() {   # DB_PASSWORD= line of an earlier hand-off file
-  local line
+read_password_file() {
+  local f=$1
+  [[ -r $f ]] || die "Cannot read --db-password-file ${f}"
+  _mode_warn "$f"
+  _pw_from_file "$f"
+  if [[ -z $REPLY ]]; then
+    [[ $PW_MARKER == true ]] && die "${f} is a hand-off file without a ZBX_DB_PASSWORD= line (password was kept on a re-run). Use the earlier hand-off file or type the password."
+    REPLY=$PW_FIRST
+  fi
+  DB_PASSWORD=$REPLY; REPLY=""; PW_FIRST=""
+}
+
+previous_handoff_password() {   # password line of an earlier hand-off file
   [[ -r $HANDOFF_FILE ]] || return 0
-  while IFS= read -r line || [[ -n $line ]]; do
-    if [[ $line == DB_PASSWORD=* ]]; then printf '%s' "${line#DB_PASSWORD=}"; return 0; fi
-  done <"$HANDOFF_FILE"
-  return 0
+  _pw_from_file "$HANDOFF_FILE"
+  printf '%s' "$REPLY"
 }
 
 collect_password() {
   local p1 p2 conf_pw="" keep_ok=false prompt
+  # --dry-run never uses the password: nothing is asked, read or checked.
+  if [[ $DRY_RUN == true ]]; then
+    DB_PASSWORD=""; PW_ORIGIN="not needed for --dry-run"
+    say "  DB password: ${MASK}   (--dry-run: not asked)"
+    return 0
+  fi
   if [[ -n $PW_FILE ]]; then read_password_file "$PW_FILE"; PW_ORIGIN="file ${PW_FILE}"; fi
   if [[ -n $PW_ORIGIN ]]; then
     v_password "$DB_PASSWORD" || die "DB password from ${PW_ORIGIN} rejected: ${VERR}"
@@ -870,7 +1136,7 @@ collect_password() {
   if [[ $MODE == app ]]; then
     # Typed once: step 2.3 logs in with it straight away and stops on a typo.
     if [[ $ASSUME_YES == true ]]; then
-      [[ -n $conf_pw ]] || die "--yes in app mode needs --db-password-file or DB_PASSWORD (from the DB server's hand-off)."
+      [[ -n $conf_pw ]] || die "--yes in app mode needs the password: --env-file ./zabbix-handoff.txt, --db-password-file or ZBX_DB_PASSWORD (from the DB server's hand-off)."
       DB_PASSWORD=$conf_pw; PW_ORIGIN="existing zabbix_server.conf"; return 0
     fi
     prompt="  DB password (from the DB server's hand-off block): "
@@ -879,7 +1145,7 @@ collect_password() {
       read_hidden p1 "$prompt"
       if [[ -z $p1 && -n $conf_pw ]]; then DB_PASSWORD=$conf_pw; PW_ORIGIN="existing zabbix_server.conf"; return 0; fi
       if v_password "$p1"; then DB_PASSWORD=$p1; PW_ORIGIN="typed"; return 0; fi
-      warn "${VERR} - try again."
+      warn "${VERR} - try again."; DLG_ERR=$VERR
     done
   fi
 
@@ -900,9 +1166,9 @@ collect_password() {
       if [[ $keep_ok == true ]]; then _keep_password "$conf_pw"; else DB_PASSWORD=$(gen_password); PW_ORIGIN="generated"; fi
       return 0
     fi
-    if ! v_password "$p1"; then warn "${VERR} - try again."; continue; fi
+    if ! v_password "$p1"; then warn "${VERR} - try again."; DLG_ERR=$VERR; continue; fi
     read_hidden p2 "  Confirm DB password: "
-    if [[ $p1 != "$p2" ]]; then warn "The two entries differ - try again."; continue; fi
+    if [[ $p1 != "$p2" ]]; then warn "The two entries differ - try again."; DLG_ERR="the two entries differ"; continue; fi
     DB_PASSWORD=$p1; PW_ORIGIN="typed"; return 0
   done
 }
@@ -920,7 +1186,10 @@ collect_inputs() {
     db)
       ask APP_IP "App/web server IP (the only host allowed to connect to MySQL):" "${ST_APP_IP}" v_ip
       if [[ -z ${SRC[DB_IP]:-} ]]; then DB_IP=$HOST_IP; fi
-      v_ip "$DB_IP" || die "Could not detect this server's IP for the hand-off; pass --db-ip."
+      if ! v_ip "$DB_IP"; then
+        [[ $DRY_RUN == true ]] || die "Could not detect this server's IP for the hand-off; pass --db-ip."
+        DB_IP="<DB_IP>"
+      fi
       ask DB_PORT "Database port?" "${ST_DB_PORT:-$DEFAULT_DB_PORT}" v_port
       ;;
     app)
@@ -956,28 +1225,72 @@ collect_inputs() {
     ask WIN_HOSTNAME "Windows host name for the printed steps:" "" v_winhost
     ask WIN_IP "Windows IP for the printed steps:" "" v_ip_opt
   fi
+  confirm_reset
 }
 
-show_summary() {
-  part "Summary"
-  say "  Scenario      : ${MODE}"
+# --reset: the only destructive action. Asked here, before anything changes,
+# always (even with --yes): a yes/no, then the database name must be typed.
+confirm_reset() {
+  [[ $RESET == true && $MODE != app && $DRY_RUN != true ]] || return 0
+  local ans="" rc=0 msg="--reset will permanently DELETE the database '${DB_NAME}' and all Zabbix data in it."
+  [[ $MODE == db ]] && msg+=" Stop zabbix-server on the app server first: sudo systemctl stop zabbix-server"
+  warn "$msg"
+  if [[ $USE_DIALOG == true ]]; then
+    _dlg --title "--reset" --defaultno --yesno "${msg}"$'\n\n'"Really drop it?" 14 76 || die "Not confirmed - nothing was dropped."
+    ans=$(_dlg --title "--reset" --inputbox "Type the database name (${DB_NAME}) to confirm the DROP:" 10 76 "") || rc=$?
+    ((rc == 0)) || ans=""
+  else
+    IFS= read -r -p "  Type the database name (${DB_NAME}) to confirm the DROP: " ans || ans=""
+  fi
+  [[ $ans == "$DB_NAME" ]] || die "Not confirmed - nothing was dropped."
+  RESET_CONFIRMED=true
+  _record "  --reset confirmed for database ${DB_NAME}"
+}
+
+SUMMARY_LINES=()
+build_summary() {   # SUMMARY_LINES - shown as text and in the dialog (password masked)
+  local net=$NET_ACTION
+  SUMMARY_LINES=("  Scenario      : ${MODE}")
   case $MODE in
-    db)     say "  This DB server: ${DB_IP}   (port ${DB_PORT})"
-            say "  App server    : ${APP_IP}  (only host allowed to log in)" ;;
-    app)    say "  This server   : ${APP_IP}"
-            say "  DB server     : ${DB_IP}:${DB_PORT}" ;;
-    single) say "  This server   : ${APP_IP}"
-            if [[ $SINGLE_CUSTOM_PORT == true ]]; then say "  MySQL         : localhost, custom port ${DB_PORT}"
-            else say "  MySQL         : localhost via socket (wizard port 0)"; fi ;;
+    db)     SUMMARY_LINES+=("  This DB server: ${DB_IP}   (port ${DB_PORT})"
+                            "  App server    : ${APP_IP}  (only host allowed to log in)") ;;
+    app)    SUMMARY_LINES+=("  This server   : ${APP_IP}" "  DB server     : ${DB_IP}:${DB_PORT}") ;;
+    single) SUMMARY_LINES+=("  This server   : ${APP_IP}")
+            if [[ $SINGLE_CUSTOM_PORT == true ]]; then SUMMARY_LINES+=("  MySQL         : 127.0.0.1:${DB_PORT} over TCP (custom port)")
+            else SUMMARY_LINES+=("  MySQL         : localhost via socket (wizard port 0)"); fi ;;
   esac
-  say "  Database/user : ${DB_NAME} / ${DB_USER}"
-  say "  DB password   : ${MASK}   (${PW_ORIGIN})"
-  say "  Timezone      : ${TIMEZONE}"
-  say "  Static IP     : ${NET_ACTION}${STATIC_IP:+ (${STATIC_IP}/${PREFIX} via ${GATEWAY:-?} on ${IFACE:-?})}"
-  [[ -n $ADD_USER ]] && say "  Admin user    : ${ADD_USER}"
-  [[ $RESET == true ]] && say "  RESET         : database ${DB_NAME} will be DROPPED and recreated"
-  if [[ $MODE != db ]]; then say "  Windows host  : ${WIN_HOSTNAME:-<WIN_HOSTNAME>} / ${WIN_IP:-<WIN_IP>}"; fi
+  if [[ $net == configure && $APPLY_NETWORK != true && $ASSUME_YES == true ]]; then net="configure (print only: no --apply-network)"; fi
+  SUMMARY_LINES+=("  Database/user : ${DB_NAME} / ${DB_USER}"
+                  "  DB password   : ${MASK}   (${PW_ORIGIN})"
+                  "  Timezone      : ${TIMEZONE}"
+                  "  Static IP     : ${net}${STATIC_IP:+ (${STATIC_IP}/${PREFIX} via ${GATEWAY:-?} on ${IFACE:-?})}")
+  [[ -n $ADD_USER ]] && SUMMARY_LINES+=("  Admin user    : ${ADD_USER}")
+  [[ $RESET == true ]] && SUMMARY_LINES+=("  RESET         : database ${DB_NAME} will be DROPPED and recreated")
+  if [[ $MODE != db ]]; then SUMMARY_LINES+=("  Windows host  : ${WIN_HOSTNAME:-<WIN_HOSTNAME>} / ${WIN_IP:-<WIN_IP>}"); fi
+  [[ -n $ENV_FILE ]] && SUMMARY_LINES+=("  Env file      : ${ENV_FILE}")
+  SUMMARY_LINES+=("  Output files  : ${OUT_DIR}")
   return 0
+}
+show_summary() {
+  local l
+  part "Summary"
+  for l in "${SUMMARY_LINES[@]}"; do say "$l"; done
+  return 0
+}
+# confirm_summary: the last question before anything is changed. In dialog
+# mode this is the summary screen (password masked); 1 = do not proceed.
+confirm_summary() {
+  local text l
+  if [[ $USE_DIALOG == true ]]; then
+    text="Nothing has been changed yet."$'\n\n'
+    for l in "${SUMMARY_LINES[@]}"; do text+="${l}"$'\n'; done
+    text+=$'\n'"Proceed with these settings?"
+    # no --scrolltext: it moves the focus to the text, and Enter stops working
+    _dlg --title "Summary" --yesno "$text" 24 78 || return 1
+    _record "  Proceed with these settings? -> yes (summary dialog)"
+    return 0
+  fi
+  ask_yn "Proceed with these settings?" y
 }
 
 # --- Result tables (preflight and --verify) ----------------------------------
@@ -1005,7 +1318,7 @@ preflight() {
   # root
   if [[ $EUID -eq 0 ]]; then vrow PASS "running as root" "uid 0"
   elif [[ $DRY_RUN == true ]]; then vrow WARN "running as root" "not root (fine for --dry-run)"
-  else vrow FAIL "running as root" "uid ${EUID}" "sudo $0 ${ARGS_TEXT}"; fi
+  else vrow FAIL "running as root" "uid ${EUID}" "sudo ${LAUNCH} ${ARGS_TEXT}"; fi
 
   # OS
   read_os
@@ -1053,7 +1366,8 @@ preflight() {
       if [[ -z $owner ]]; then vrow PASS "port ${DB_PORT} free (ss -ltn)" "nothing listening"
       elif [[ $owner == mysqld ]]; then vrow PASS "port ${DB_PORT} free (ss -ltn)" "already MySQL (re-run)"
       else vrow FAIL "port ${DB_PORT} free (ss -ltn)" "in use by ${owner}" "choose another --db-port or stop ${owner}"; fi
-      if command -v ping >/dev/null 2>&1 && ping -c1 -W2 "$APP_IP" >/dev/null 2>&1; then vrow PASS "app server ${APP_IP} answers ping" ""
+      if ! v_ip "$APP_IP"; then vrow WARN "app server ${APP_IP} answers ping" "placeholder - not checked (--dry-run)"
+      elif command -v ping >/dev/null 2>&1 && ping -c1 -W2 "$APP_IP" >/dev/null 2>&1; then vrow PASS "app server ${APP_IP} answers ping" ""
       else vrow WARN "app server ${APP_IP} answers ping" "no reply (may just block ICMP)"; fi
       ;;
     app)
@@ -1063,11 +1377,12 @@ preflight() {
       if [[ $DRY_RUN != true ]] && ! is_local_ip "$APP_IP"; then vrow WARN "APP_IP is this machine" "${APP_IP} is not on any local interface (OK only behind NAT)"; fi
       if pkg_installed mysql-server; then vrow WARN "role: APP server" "mysql-server is installed here - is this the DB machine (option 2)?"; fi
       _action "\$ timeout 3 bash -c '</dev/tcp/${DB_IP}/${DB_PORT}'   # is the DB server answering?"
-      if tcp_open "$DB_IP" "$DB_PORT"; then vrow PASS "DB server ${DB_IP}:${DB_PORT} answers" "TCP connect OK"
+      if [[ $DRY_RUN == true ]] && ! v_ip "$DB_IP"; then vrow WARN "DB server ${DB_IP}:${DB_PORT} answers" "placeholder - not checked (--dry-run)"
+      elif tcp_open "$DB_IP" "$DB_PORT"; then vrow PASS "DB server ${DB_IP}:${DB_PORT} answers" "TCP connect OK"
       else
         vrow FAIL "DB server ${DB_IP}:${DB_PORT} answers" "no TCP answer within 3 s" "see the likely causes below"
         PF_HINTS+=("Likely causes, checked on the DB server ${DB_IP}:"
-                   "  1. db mode not run yet          -> sudo ./zabbix-setup.sh --mode db --app-ip ${APP_IP}"
+                   "  1. db mode not run yet          -> sudo ${LAUNCH} --mode db --app-ip ${APP_IP}"
                    "  2. MySQL not running            -> sudo systemctl status mysql"
                    "  3. bind-address is 127.0.0.1    -> /etc/mysql/mysql.conf.d/mysqld.cnf must say 0.0.0.0"
                    "  4. port mismatch                -> sudo ss -ltn | grep mysqld  (must show ${DB_PORT})"
@@ -1087,7 +1402,7 @@ preflight() {
     vrow WARN "classic zabbix-agent absent" "installed - it also uses port ${ZBX_AGENT_PORT}" "sudo apt remove zabbix-agent (this setup uses zabbix-agent2)"
   fi
   if [[ $RESET == true && $MODE == app ]]; then
-    vrow FAIL "--reset on the right node" "app mode cannot drop the remote DB" "run --reset on the DB server: sudo ./zabbix-setup.sh --mode db --reset"
+    vrow FAIL "--reset on the right node" "app mode cannot drop the remote DB" "run --reset on the DB server: sudo ${LAUNCH} --mode db --reset"
   fi
   vrow PASS "ufw" "$(ufw_state) (it is never enabled by this script)"
 
@@ -1204,7 +1519,7 @@ network:
 EOF
 )
   if [[ $DRY_RUN == true ]]; then
-    _action "\$ sudo mkdir -p ${BACKUP_DIR}${NETPLAN_DIR} && sudo cp -a ${NETPLAN_DIR}/*.yaml ${BACKUP_DIR}${NETPLAN_DIR}/"
+    _action "\$ sudo install -d -m 700 ${BACKUP_ROOT} && sudo mkdir -p ${BACKUP_DIR}${NETPLAN_DIR} && sudo cp -a ${NETPLAN_DIR}/*.yaml ${BACKUP_DIR}${NETPLAN_DIR}/ && sudo chmod 600 ${BACKUP_DIR}${NETPLAN_DIR}/*.yaml"
   else
     for f in "$NETPLAN_DIR"/*.yaml; do [[ -e $f ]] && backup_file "$f"; done
   fi
@@ -1214,12 +1529,23 @@ EOF
   _action "\$ sudo netplan try --timeout ${NETPLAN_TRY_TIMEOUT}   # press ENTER to keep; no ENTER = automatic rollback"
   [[ $DRY_RUN == true ]] && return 0
 
+  # Applying needs an explicit opt-in: --apply-network, or a yes typed now.
+  # --yes alone never changes the network: the YAML above is all it does.
+  if [[ $APPLY_NETWORK != true && $ASSUME_YES == true ]]; then
+    warn "Not applied and nothing written: --yes never changes the network by itself. The YAML above is what would be written."
+    warn "Reminder: re-run with --apply-network to apply it (netplan try), from the VM console if the address changes."
+    return 0
+  fi
   warn "Changing the IP over SSH can drop your session. netplan try rolls back after ${NETPLAN_TRY_TIMEOUT} s unless you press ENTER."
   if [[ $STATIC_IP != "$DET_IP" ]]; then
     warn "The address changes (${DET_IP:-?} -> ${STATIC_IP}). Over SSH you will lose this session and cannot confirm - use the VM console for this step."
   fi
-  if [[ $ASSUME_YES == true ]] || ! ask_yn "Apply this static IP now?" n; then
+  if [[ $APPLY_NETWORK != true ]] && ! ask_yn "Apply this static IP now?" n; then
     warn "Not applied. Reminder: a changing DHCP address will break the setup later."
+    return 0
+  fi
+  if [[ ! -t 0 ]]; then
+    warn "Not applied: netplan try needs a terminal to confirm with ENTER (stdin is not a terminal). Nothing was written."
     return 0
   fi
   printf '%s\n' "$yaml" >"$NETPLAN_FILE"
@@ -1264,6 +1590,14 @@ chrony_synced() {
 # 7. Part 1 - Database node (db mode; single mode runs it locally)
 # =============================================================================
 db_user_host() { if [[ $MODE == single ]]; then printf 'localhost'; else printf '%s' "$APP_IP"; fi; }
+# Every host the Zabbix account is created for. Single mode with a custom
+# port connects over TCP to 127.0.0.1, which MySQL may match as 'localhost' or
+# as '127.0.0.1' - so both accounts exist, same password, same grants.
+db_user_hosts() {
+  db_user_host; printf '\n'
+  if [[ $MODE == single && $SINGLE_CUSTOM_PORT == true ]]; then printf '127.0.0.1\n'; fi
+  return 0
+}
 
 part1_database() {
   part "Part 1 - Database node"
@@ -1278,17 +1612,20 @@ part1_database() {
   fi
 
   # ---- 1.2 bind-address and port ------------------------------------------
+  local need_restart=0
   if [[ $MODE == db ]]; then
     step 1.2 "Allow remote connections and set port ${DB_PORT}"
+    mysqld_config_current "$DB_PORT" 0.0.0.0 || need_restart=$?
     backup_file "$MYSQLD_CNF"
     edit_kv "$MYSQLD_CNF" mysqld bind-address 0.0.0.0 ini
     edit_kv "$MYSQLD_CNF" mysqld port "$DB_PORT" ini
-    restart_mysql_on_port "$DB_PORT"
+    restart_mysql_if_needed "$DB_PORT" "$need_restart"
   elif [[ $SINGLE_CUSTOM_PORT == true ]]; then
     step 1.2 "Set MySQL port ${DB_PORT} (single VM: bind-address stays 127.0.0.1)"
+    mysqld_config_current "$DB_PORT" || need_restart=$?
     backup_file "$MYSQLD_CNF"
     edit_kv "$MYSQLD_CNF" mysqld port "$DB_PORT" ini
-    restart_mysql_on_port "$DB_PORT"
+    restart_mysql_if_needed "$DB_PORT" "$need_restart"
   else
     step 1.2 "Remote access / custom port"
     local cur_port=""
@@ -1318,8 +1655,9 @@ part1_database() {
       "If root has a password, put it in /root/.my.cnf ([client] password=...) and re-run."
   fi
   [[ $RESET == true ]] && reset_database
-  local host state trust grant_db sql_show sql_real pw_lit
-  host=$(db_user_host)
+  local host state trust grant_db sql_show sql_real pw_lit tail_sql=""
+  local -a hosts=()
+  mapfile -t hosts < <(db_user_hosts)
   grant_db=${DB_NAME//_/\\_}           # _ is a wildcard in GRANT ... ON db.*
   [[ $MODE == db ]] && rename_moved_user
   # Trust must be 1 while the schema is imported (Part 2 step 3) and 0
@@ -1331,16 +1669,23 @@ part1_database() {
   pw_lit=$(sql_quote "$DB_PASSWORD")
   sql_show="CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;"
   sql_real=$sql_show
-  if [[ $PW_KEEP == true ]]; then
-    sql_show+=$'\n'"-- '${DB_USER}'@'${host}' exists: password kept"
-  else
-    sql_show+=$'\n'"CREATE USER IF NOT EXISTS '${DB_USER}'@'${host}' IDENTIFIED BY '${MASK}';"
-    sql_show+=$'\n'"ALTER USER '${DB_USER}'@'${host}' IDENTIFIED BY '${MASK}';   -- re-run safe"
-    sql_real+=$'\n'"CREATE USER IF NOT EXISTS '${DB_USER}'@'${host}' IDENTIFIED BY ${pw_lit};"
-    sql_real+=$'\n'"ALTER USER '${DB_USER}'@'${host}' IDENTIFIED BY ${pw_lit};"
-  fi
-  local tail_sql="GRANT ALL PRIVILEGES ON \`${grant_db}\`.* TO '${DB_USER}'@'${host}';"
-  tail_sql+=$'\n'"SET GLOBAL log_bin_trust_function_creators = ${trust};"
+  for host in "${hosts[@]}"; do
+    if [[ $PW_KEEP == true && $SINGLE_CUSTOM_PORT == true && -n $DB_PASSWORD ]]; then
+      # single + custom port re-run: the kept password is known (from
+      # zabbix_server.conf) - create only a missing account, change none.
+      sql_show+=$'\n'"CREATE USER IF NOT EXISTS '${DB_USER}'@'${host}' IDENTIFIED BY '${MASK}';   -- password kept"
+      sql_real+=$'\n'"CREATE USER IF NOT EXISTS '${DB_USER}'@'${host}' IDENTIFIED BY ${pw_lit};"
+    elif [[ $PW_KEEP == true ]]; then
+      sql_show+=$'\n'"-- '${DB_USER}'@'${host}' exists: password kept"
+    else
+      sql_show+=$'\n'"CREATE USER IF NOT EXISTS '${DB_USER}'@'${host}' IDENTIFIED BY '${MASK}';"
+      sql_show+=$'\n'"ALTER USER '${DB_USER}'@'${host}' IDENTIFIED BY '${MASK}';   -- re-run safe"
+      sql_real+=$'\n'"CREATE USER IF NOT EXISTS '${DB_USER}'@'${host}' IDENTIFIED BY ${pw_lit};"
+      sql_real+=$'\n'"ALTER USER '${DB_USER}'@'${host}' IDENTIFIED BY ${pw_lit};"
+    fi
+    tail_sql+="GRANT ALL PRIVILEGES ON \`${grant_db}\`.* TO '${DB_USER}'@'${host}';"$'\n'
+  done
+  tail_sql+="SET GLOBAL log_bin_trust_function_creators = ${trust};"
   tail_sql+=$'\n'"FLUSH PRIVILEGES;"
   sql_show+=$'\n'"$tail_sql"; sql_real+=$'\n'"$tail_sql"
   run_sql_root "$sql_show" "$sql_real"
@@ -1368,6 +1713,15 @@ part1_database() {
     info "The real test runs FROM the app server (${APP_IP}), not here:"
     info "    mysql -h ${DB_IP} -P ${DB_PORT} -u ${DB_USER} -p"
     info "app mode does exactly this before it imports the schema."
+  elif [[ $SINGLE_CUSTOM_PORT == true ]]; then
+    step 1.5 "Verify the zabbix user can log in over TCP (127.0.0.1:${DB_PORT})"
+    _action "\$ mysql -h 127.0.0.1 -P ${DB_PORT} -u ${DB_USER} -p ${DB_NAME} -e 'SELECT 1;'"
+    if [[ $DRY_RUN != true ]]; then
+      make_cnf "$DB_USER" "$DB_PASSWORD"; set_db_target 127.0.0.1 "$DB_PORT"
+      local out
+      out=$(mysql_zbx "$DB_NAME" -e "SELECT 1" 2>&1) || die "TCP login as ${DB_USER} to 127.0.0.1:${DB_PORT} failed: $(explain_mysql_error "$out")"
+      ok "${DB_USER} can log in over TCP to 127.0.0.1:${DB_PORT}"
+    fi
   else
     step 1.5 "Verify the zabbix user can log in (local socket)"
     _action "\$ mysql -u ${DB_USER} -p ${DB_NAME} -e 'SELECT 1;'"
@@ -1380,6 +1734,24 @@ part1_database() {
   fi
 }
 
+# A re-run with the same settings must not restart MySQL: that would cut the
+# app server's zabbix-server off for a moment. Called BEFORE the edits.
+# Returns 0 = already current (no restart), 1 = differs or not listening.
+mysqld_config_current() {   # mysqld_config_current PORT [BIND_ADDRESS]
+  [[ $DRY_RUN == true ]] && return 1
+  [[ $(kv_get "$MYSQLD_CNF" mysqld port || true) == "$1" ]] || return 1
+  if [[ -n ${2:-} && $(kv_get "$MYSQLD_CNF" mysqld bind-address || true) != "$2" ]]; then return 1; fi
+  [[ $(listen_addrs "$1") == *"${2:-}:$1"* ]] || return 1
+  return 0
+}
+restart_mysql_if_needed() {  # restart_mysql_if_needed PORT 0|1
+  if [[ $2 == 0 ]]; then
+    _action "\$ sudo systemctl restart mysql"
+    skip "bind-address/port already set and MySQL listens on $(listen_addrs "$1") - no restart needed"
+    return 0
+  fi
+  restart_mysql_on_port "$1"
+}
 restart_mysql_on_port() {
   run systemctl restart mysql
   _action "\$ sudo ss -ltn | grep :$1   # MySQL must listen on $1"
@@ -1427,15 +1799,12 @@ rename_moved_user() {
   return 0
 }
 
-# --reset: the only destructive action. Always asks, even with --yes.
+# --reset: the only destructive action. It was confirmed (typed database
+# name) in confirm_reset, before anything changed - always, even with --yes.
 reset_database() {
   _action "\$ sudo mysql -e \"DROP DATABASE IF EXISTS \\\`${DB_NAME}\\\`;\"   # --reset (guide troubleshooting: ERROR 1050)"
   [[ $DRY_RUN == true ]] && return 0
-  warn "--reset will permanently DELETE the database '${DB_NAME}' and all Zabbix data in it."
-  [[ $MODE == db ]] && warn "Stop zabbix-server on the app server first: sudo systemctl stop zabbix-server"
-  local ans=""
-  IFS= read -r -p "  Type the database name (${DB_NAME}) to confirm the DROP: " ans || ans=""
-  [[ $ans == "$DB_NAME" ]] || die "Not confirmed - nothing was dropped."
+  [[ $RESET_CONFIRMED == true ]] || die "--reset was not confirmed - nothing was dropped."
   if [[ $MODE == single ]] && svc_active zabbix-server; then run systemctl stop zabbix-server; fi
   printf '%s\n' "DROP DATABASE IF EXISTS \`${DB_NAME}\`;" | mysql_root 2>&1 | _logpipe
   ok "database ${DB_NAME} dropped - it is recreated empty below"
@@ -1447,7 +1816,9 @@ reset_database() {
 part2_app() {
   part "Part 2 - App & Web server"
   local db_host=$DB_IP db_port=$DB_PORT
-  if [[ $MODE == single ]]; then db_host=localhost; [[ $SINGLE_CUSTOM_PORT == true ]] || db_port=""; fi
+  # single: socket (DBHost=localhost, no DBPort) or, with a custom port, TCP
+  # to 127.0.0.1 so the port is really used (DBHost=127.0.0.1, DBPort=port)
+  if [[ $MODE == single ]]; then db_host=$(single_db_host); [[ $SINGLE_CUSTOM_PORT == true ]] || db_port=""; fi
 
   # ---- 2.1 Repository ----------------------------------------------------------
   step 2.1 "Add the Zabbix ${ZBX_VERSION} repository (Ubuntu ${OS_VER:-$TARGET_UBUNTU})"
@@ -1600,7 +1971,7 @@ has_locale() { local l; l=$(locale -a 2>/dev/null || true); [[ ${l,,} == *en_us.
 # Step 2.3: test the login, import (skipped if already there), reset trust.
 import_schema() {
   local host=$1 port=$2 shown_conn out state flags rc=0 errf
-  if [[ $MODE == app ]]; then
+  if [[ -n $host && $host != localhost ]]; then
     shown_conn="mysql -h ${host} -P ${port} -u ${DB_USER} -p"
   else
     shown_conn="mysql -u ${DB_USER} -p"
@@ -1623,7 +1994,7 @@ import_schema() {
       skip "schema already imported (dbversion and users tables present)" ;;
     partial)
       die "The database '${DB_NAME}' holds a PARTIAL schema - importing again would stop with ERROR 1050 (table already exists)." \
-          "Recreate it on the DB node:  sudo ./zabbix-setup.sh --mode $([[ $MODE == app ]] && echo db || echo single) --reset" ;;
+          "Recreate it on the DB node:  sudo ${LAUNCH} --mode $([[ $MODE == app ]] && echo db || echo single) --reset" ;;
     *)
       if [[ $DRY_RUN != true ]]; then
         flags=$(mysql_zbx -e "SELECT CONCAT(@@GLOBAL.log_bin, ' ', @@GLOBAL.log_bin_trust_function_creators)" 2>/dev/null || echo "")
@@ -1666,7 +2037,7 @@ import_schema() {
       TRUST_PENDING=true
       warn "ACTION ON THE DB SERVER (${DB_IP}): the zabbix account may not change global settings. Run there:"
       warn "    sudo mysql -e 'SET GLOBAL log_bin_trust_function_creators = 0;'"
-      warn "  or re-run  sudo ./zabbix-setup.sh --mode db --yes  (it sees the imported schema and sets 0)."
+      warn "  or re-run  sudo ${LAUNCH} --mode db --yes  (it sees the imported schema and sets 0)."
     fi
   fi
 }
@@ -1754,31 +2125,109 @@ open_app_firewall() {
 # 9. Hand-off (db), NEXT STEPS (app/single). The password appears ONLY on the
 #    terminal and in the chmod-600 file - the log gets the masked version.
 # =============================================================================
+# The hand-off is a valid env file (ZBX_ names), so on the app server:
+#   sudo ./zabbix-setup.sh --mode app --env-file ./zabbix-handoff.txt
+# --db-password-file still accepts it as well.
 render_handoff() {   # render_handoff PASSWORD_OR_MASK
-  local pwline="DB_PASSWORD=$1"
-  [[ -z $1 ]] && pwline="# DB_PASSWORD unchanged (kept on a re-run) - use the value from the first run"
+  local pwline="ZBX_DB_PASSWORD='$1'"
+  [[ -z $1 ]] && pwline="# ZBX_DB_PASSWORD unchanged (kept on a re-run) - use the value from the first run"
   cat <<EOF
-###########################################################################
+# ###########################################################################
 #  zabbix-setup hand-off - values for the APP server  ($(date '+%F %T'))
-###########################################################################
-DB_IP=${DB_IP}
-DB_PORT=${DB_PORT}
-DB_NAME=${DB_NAME}
-DB_USER=${DB_USER}
+#  This file is an env file: load it with --env-file. Keep it chmod 600.
+# ###########################################################################
+ZBX_MODE='app'
+ZBX_APP_IP='${APP_IP}'
+ZBX_DB_IP='${DB_IP}'
+ZBX_DB_PORT='${DB_PORT}'
+ZBX_DB_NAME='${DB_NAME}'
+ZBX_DB_USER='${DB_USER}'
 ${pwline}
-APP_IP=${APP_IP}
-
-Next, on the APP server (${APP_IP}), with this same script:
-  sudo ./zabbix-setup.sh --mode app --app-ip ${APP_IP} --db-ip ${DB_IP} --db-port ${DB_PORT} --db-name ${DB_NAME} --db-user ${DB_USER} --timezone ${TIMEZONE}
-It prompts for the password. Or copy this file over securely (scp) and add:
-  --db-password-file ./zabbix-handoff.txt
-Delete this file once the app server is done.
-
-When the app server has imported the schema, come back to THIS server and run:
-  sudo ./zabbix-setup.sh --mode db --yes
-(it detects the schema and sets log_bin_trust_function_creators back to 0)
-###########################################################################
+ZBX_TIMEZONE='${TIMEZONE}'
+#
+# Next, on the APP server (${APP_IP}), with this same script:
+#   1. copy this file over securely, e.g.  scp zabbix-handoff.txt <user>@${APP_IP}:
+#   2. sudo ${LAUNCH} --mode app --env-file ./zabbix-handoff.txt
+#   Without the file it prompts for the password:
+#      sudo ${LAUNCH} --mode app --app-ip ${APP_IP} --db-ip ${DB_IP} --db-port ${DB_PORT}
+#   Delete this file on both servers once the app server is done.
+#
+# When the app server has imported the schema, come back to THIS server and run:
+#   sudo ${LAUNCH} --mode db --yes
+#   (it detects the schema and sets log_bin_trust_function_creators back to 0)
+# ###########################################################################
 EOF
+}
+
+# zabbix-setup.env: every setting of this run, as an env file (section E).
+# The static IP keys are only written when this run configured one, so a
+# re-run with the file never reconfigures the network by surprise; single
+# mode on the socket has no ZBX_DB_PORT (a port would mean "custom port").
+_env_kv() { if [[ -n $2 ]]; then printf "ZBX_%s='%s'\n" "$1" "$2"; fi; return 0; }
+render_env() {   # render_env PASSWORD_OR_MASK
+  local pw=$1
+  printf '# zabbix-setup.sh %s - settings of the %s run on %s (%s)\n' "$SCRIPT_VERSION" "$MODE" "${APP_IP:-?}" "$(date '+%F %T')"
+  printf '# Load with:  sudo %s --env-file ./zabbix-setup.env  (it is also read automatically\n' "$LAUNCH"
+  printf '# from the current directory). Parsed, never sourced: values are literal.\n'
+  printf '# It holds the database password: keep it chmod 600 and out of git.\n'
+  _env_kv MODE "$MODE"
+  _env_kv APP_IP "$APP_IP"
+  [[ $MODE == app || $MODE == db ]] && _env_kv DB_IP "$DB_IP"
+  if [[ $MODE == single && $SINGLE_CUSTOM_PORT != true ]]; then
+    printf '# ZBX_DB_PORT not set: MySQL through the local socket (wizard port 0)\n'
+  else
+    _env_kv DB_PORT "$DB_PORT"
+  fi
+  _env_kv DB_NAME "$DB_NAME"
+  _env_kv DB_USER "$DB_USER"
+  _env_kv TIMEZONE "$TIMEZONE"
+  _env_kv WIN_HOSTNAME "$WIN_HOSTNAME"
+  _env_kv WIN_IP "$WIN_IP"
+  if [[ $NET_ACTION == configure ]]; then
+    _env_kv IFACE "$IFACE"; _env_kv STATIC_IP "$STATIC_IP"; _env_kv PREFIX "$PREFIX"
+    _env_kv GATEWAY "$GATEWAY"; _env_kv DNS "$DNS"
+  else
+    printf '# static IP: %s in this run - ZBX_STATIC_IP not set\n' "${NET_ACTION:-skip}"
+  fi
+  _env_kv SSH_KEY_FILE "$SSH_KEY_FILE"
+  if [[ $NO_ENV_PASSWORD == true ]]; then
+    printf '# ZBX_DB_PASSWORD left out (--no-env-password)\n'
+  elif [[ -z $pw ]]; then
+    printf '# ZBX_DB_PASSWORD unknown (kept on a re-run without an earlier hand-off)\n'
+  else
+    _env_kv DB_PASSWORD "$pw"
+  fi
+}
+write_env_file() {
+  if [[ -e $DEFAULT_ENV_FILE ]]; then write_private "${DEFAULT_ENV_FILE}.bak" <"$DEFAULT_ENV_FILE"; fi
+  render_env "$DB_PASSWORD" | write_private "$DEFAULT_ENV_FILE"
+  info "settings saved to ${DEFAULT_ENV_FILE} (chmod 600$([[ $NO_ENV_PASSWORD == true ]] && echo ', no password' || echo ', includes the DB password'))"
+  [[ -e ${DEFAULT_ENV_FILE}.bak ]] && info "previous version kept as ${DEFAULT_ENV_FILE}.bak (chmod 600)"
+  return 0
+}
+
+# If the output directory is inside a git repository, warn (never edit
+# .gitignore): the generated files hold the DB password.
+git_warning() {   # git_warning FILE...
+  local d=$OUT_DIR top="" f
+  local -a exposed=()
+  while true; do
+    if [[ -e ${d}/.git ]]; then top=$d; break; fi
+    [[ $d == / || -z $d ]] && break
+    d=${d%/*}; d=${d:-/}
+  done
+  [[ -n $top ]] || return 0
+  for f in "$@"; do
+    if command -v git >/dev/null 2>&1 && git -c safe.directory="$top" -C "$OUT_DIR" check-ignore -q -- "$f" 2>/dev/null; then continue; fi
+    exposed+=("${f##*/}")
+  done
+  if ((${#exposed[@]} == 0)); then
+    info "git: ${OUT_DIR} is inside the repository ${top}; the generated files are git-ignored."
+  else
+    warn "${OUT_DIR} is inside a git repository (${top}). ${exposed[*]} contain(s) the DB password and is/are NOT ignored."
+    warn "Add them to .gitignore (e.g. zabbix-setup.env*, zabbix-handoff.txt, zabbix-next-steps.txt) - this script does not edit .gitignore."
+  fi
+  return 0
 }
 
 render_next_steps() {   # render_next_steps PASSWORD_OR_MASK
@@ -1787,7 +2236,7 @@ render_next_steps() {   # render_next_steps PASSWORD_OR_MASK
     host=$DB_IP; port=$DB_PORT
     port_note="type it explicitly - 0 means 3306 and the test would fail"
   elif [[ $SINGLE_CUSTOM_PORT == true ]]; then
-    host=localhost; port=$DB_PORT; port_note="custom port chosen for this VM"
+    host=127.0.0.1; port=$DB_PORT; port_note="custom port: TCP to 127.0.0.1, not localhost (= socket)"
   else
     host=localhost; port=0; port_note="0 = default (local socket)"
   fi
@@ -1802,7 +2251,7 @@ EOF
 
 0. FIRST, on the DB server ${DB_IP} (finishes guide Part 2 step 3):
      sudo mysql -e 'SET GLOBAL log_bin_trust_function_creators = 0;'
-   or: sudo ./zabbix-setup.sh --mode db --yes
+   or: sudo ${LAUNCH} --mode db --yes
 EOF
   fi
   cat <<EOF
@@ -1843,7 +2292,11 @@ EOF
    On Windows (PowerShell):  Test-NetConnection ${APP_IP} -Port ${ZBX_TRAPPER_PORT}   -> TcpTestSucceeded : True
    Web UI: Monitoring > Latest data, host ${wh} - CPU, memory, disk within minutes
    Agent log: ${WIN_AGENT_DIR}\\zabbix_agent2.log
-   On this server, any time:  sudo ./zabbix-setup.sh --verify
+   On this server, any time:  sudo ${LAUNCH} --verify
+
+Settings of this run: ${DEFAULT_ENV_FILE}
+   (ZBX_* env file, read again automatically from this directory; it holds
+   the DB password unless --no-env-password: chmod 600, keep it out of git)
 ###########################################################################
 EOF
 }
@@ -1857,6 +2310,7 @@ emit_secret_block() {   # emit_secret_block RENDER_FN FILE
     return 0
   fi
   printf '\n'
+  # the real password goes to the terminal (and the 600 file) only, never via say()
   "$fn" "$pw"
   "$fn" "$pw" | write_private "$file"
   if [[ $LOG_ON == true ]]; then
@@ -1912,13 +2366,13 @@ vc_mysql_local() {
   case $state in
     full) vrow PASS "database ${DB_NAME} has the schema" "$(mysql_root -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${DB_NAME}'") tables" ;;
     none) if [[ $MODE == db ]]; then vrow WARN "database ${DB_NAME} has the schema" "exists, still empty" "run app mode on ${APP_IP} (Part 2 step 3)"
-          else vrow FAIL "database ${DB_NAME} has the schema" "exists, empty" "re-run: sudo ./zabbix-setup.sh --mode single"; fi ;;
-    partial) vrow FAIL "database ${DB_NAME} has the schema" "partial import" "sudo ./zabbix-setup.sh --mode ${MODE} --reset, then import again" ;;
-    *) vrow FAIL "database ${DB_NAME} exists" "missing" "re-run: sudo ./zabbix-setup.sh --mode ${MODE}" ;;
+          else vrow FAIL "database ${DB_NAME} has the schema" "exists, empty" "re-run: sudo ${LAUNCH} --mode single"; fi ;;
+    partial) vrow FAIL "database ${DB_NAME} has the schema" "partial import" "sudo ${LAUNCH} --mode ${MODE} --reset, then import again" ;;
+    *) vrow FAIL "database ${DB_NAME} exists" "missing" "re-run: sudo ${LAUNCH} --mode ${MODE}" ;;
   esac
   n=$(mysql_root -e "SELECT COUNT(*) FROM mysql.user WHERE user='${DB_USER}' AND host='${host}'" 2>/dev/null || echo 0)
   if [[ $n == 1 ]]; then vrow PASS "user '${DB_USER}'@'${host}' exists" ""
-  else vrow FAIL "user '${DB_USER}'@'${host}' exists" "missing" "re-run: sudo ./zabbix-setup.sh --mode ${MODE}"; fi
+  else vrow FAIL "user '${DB_USER}'@'${host}' exists" "missing" "re-run: sudo ${LAUNCH} --mode ${MODE}"; fi
   trust=$(mysql_root -e "SELECT @@GLOBAL.log_bin_trust_function_creators" 2>/dev/null || echo "?")
   if [[ $trust == 0 ]]; then vrow PASS "log_bin_trust_function_creators = 0" ""
   elif [[ $state != full ]]; then vrow WARN "log_bin_trust_function_creators = 0" "1 (expected until the schema is imported)"
@@ -1939,7 +2393,7 @@ verify_db() {
   for a in $remote; do [[ $a == "${DB_USER}@${APP_IP}" ]] || extra+="${a} "; done
   if [[ $remote == "${DB_USER}@${APP_IP}" ]]; then vrow PASS "only remote account is ${DB_USER}@${APP_IP}" ""
   elif [[ -n $extra ]]; then vrow FAIL "only remote account is ${DB_USER}@${APP_IP}" "also: ${extra% }" "remove unused ones: sudo mysql -e \"DROP USER 'name'@'host';\""
-  else vrow FAIL "only remote account is ${DB_USER}@${APP_IP}" "none found" "re-run: sudo ./zabbix-setup.sh --mode db"; fi
+  else vrow FAIL "only remote account is ${DB_USER}@${APP_IP}" "none found" "re-run: sudo ${LAUNCH} --mode db"; fi
   vc_chrony
 }
 
@@ -1977,7 +2431,13 @@ verify_app() {
   if [[ -r $ZBX_SERVER_LOG ]]; then
     recent=$(tail -n 400 "$ZBX_SERVER_LOG" | awk '/Starting Zabbix Server/ {buf=""} {buf = buf $0 ORS} END {printf "%s", buf}') || recent=""
     errs=$(grep -Ei 'database is down|connection to database .* failed|cannot (connect|use) (to )?(the )?database|Access denied for user|\[Z300[0-9]\]' <<<"$recent" || true)
+    # an outage that zabbix-server already recovered from (e.g. MySQL was
+    # restarted) is a WARN, not a FAIL: look after the last reconnect line
+    local after_ok
+    after_ok=$(awk '/database connection re-established/ {buf=""; seen=1; next} {buf = buf $0 ORS} END {if (seen) printf "%s", buf}' <<<"$recent") || after_ok=""
     if [[ -z $errs ]]; then vrow PASS "no DB errors in zabbix_server.log" "since last start"
+    elif [[ $recent == *"database connection re-established"* ]] && ! grep -Eqi 'database is down|connection to database .* failed|\[Z300[0-9]\]' <<<"$after_ok"; then
+      vrow WARN "no DB errors in zabbix_server.log" "a DB outage since last start, recovered (database connection re-established)"
     else vrow FAIL "no DB errors in zabbix_server.log" "${errs%%$'\n'*}" "fix the DB* settings / reachability, then sudo systemctl restart zabbix-server"; fi
   else
     vrow WARN "no DB errors in zabbix_server.log" "${ZBX_SERVER_LOG} not found"
@@ -1989,10 +2449,27 @@ verify_app() {
   vc_ufw "$ZBX_TRAPPER_PORT"
 }
 
+# Custom port in single mode: zabbix-server must really talk TCP to
+# 127.0.0.1:PORT (not the socket) - look for its established connections.
+vc_zbx_tcp() {
+  local port=$1 out line n=0
+  out=$(ss -tnpH state established "dport = :${port}" 2>/dev/null || true)
+  while IFS= read -r line; do
+    [[ $line == *"127.0.0.1:${port}"* && $line == *zabbix_server* ]] && n=$((n + 1))
+  done <<<"$out"
+  if ((n > 0)); then vrow PASS "zabbix-server -> 127.0.0.1:${port} over TCP" "${n} established (ss -tnp)"
+  else vrow FAIL "zabbix-server -> 127.0.0.1:${port} over TCP" "no established connection (ss -tnp)" "DBHost=127.0.0.1 and DBPort=${port} in ${ZBX_SERVER_CONF}, then sudo systemctl restart zabbix-server"; fi
+}
+
 verify_single() {
+  local n
   vc_mysql_local localhost || true
   if [[ -n $DB_PORT && $DB_PORT != 0 ]]; then
+    n=$(mysql_root -e "SELECT COUNT(*) FROM mysql.user WHERE user='${DB_USER}' AND host='127.0.0.1'" 2>/dev/null || echo 0)
+    if [[ $n == 1 ]]; then vrow PASS "user '${DB_USER}'@'127.0.0.1' exists" "custom port: TCP login"
+    else vrow FAIL "user '${DB_USER}'@'127.0.0.1' exists" "missing" "re-run: sudo ${LAUNCH} --mode single --db-port ${DB_PORT}"; fi
     vc_listen "$DB_PORT" "MySQL" "set port = ${DB_PORT} in ${MYSQLD_CNF}; sudo systemctl restart mysql"
+    vc_zbx_tcp "$DB_PORT"
   fi
   verify_app
   vc_chrony
@@ -2005,7 +2482,8 @@ mysql_port_report() {
       port=$(mysql_root -e "SELECT @@port" 2>/dev/null || echo "?")
       addrs=$(listen_addrs "$port")
       say "  MySQL is actually listening on port ${port}: ${addrs:-<not listening>}"
-      if [[ $MODE == single && ${DB_PORT:-0} == 0 ]]; then say "  (Zabbix connects through the local socket - wizard port 0)"; fi ;;
+      if [[ $MODE == single && ${DB_PORT:-0} == 0 ]]; then say "  (Zabbix connects through the local socket - wizard port 0)"
+      elif [[ $MODE == single ]]; then say "  (Zabbix connects over TCP to 127.0.0.1:${DB_PORT})"; fi ;;
     app)
       if [[ -r $ZBX_SERVER_CONF ]]; then
         make_cnf "$(kv_get "$ZBX_SERVER_CONF" "" DBUser || true)" "$(kv_get "$ZBX_SERVER_CONF" "" DBPassword || true)"
@@ -2070,7 +2548,7 @@ init_output() {
     give_to_sudo_user "$MANUAL_FILE"
     return 0
   fi
-  [[ $EUID -eq 0 ]] || die "Run as root:  sudo $0 ${ARGS_TEXT}" "(--dry-run works without root)"
+  [[ $EUID -eq 0 ]] || die "Run as root:  sudo ${LAUNCH} ${ARGS_TEXT}" "(--dry-run works without root)"
   touch "$LOG_FILE"; chmod 600 "$LOG_FILE"
   LOG_ON=true
   _record "===== zabbix-setup.sh ${SCRIPT_VERSION} started: ${ARGS_TEXT:-<no arguments>} ====="
@@ -2082,6 +2560,9 @@ main() {
   init_output
   _emit "$C_BOLD" "zabbix-setup.sh ${SCRIPT_VERSION} - Zabbix ${ZBX_VERSION} LTS on Ubuntu ${TARGET_UBUNTU}$([[ $DRY_RUN == true ]] && echo '   [DRY RUN - nothing will be changed]')"
   [[ $LOG_ON == true ]] && say "Log: ${LOG_FILE}"
+  say "Output files (hand-off, env file, next steps, manual steps) go to: ${OUT_DIR}"
+  if [[ $PW_ENV_DEPRECATED == true ]]; then warn "DB_PASSWORD is deprecated - use ZBX_DB_PASSWORD (same meaning)."; fi
+  pick_env_file                               # flag > env var > env file > prompt
 
   # --verify ------------------------------------------------------------------
   if [[ $DO_VERIFY == true ]]; then
@@ -2091,6 +2572,9 @@ main() {
     run_verify || rc=$?
     exit "$rc"
   fi
+
+  # whiptail dialogs on a terminal; plain text prompts otherwise
+  if [[ $NO_DIALOG != true && $ASSUME_YES != true ]] && dialog_possible; then USE_DIALOG=true; fi
 
   # --add-user on its own ---------------------------------------------------------
   if [[ -n $ADD_USER && -z $MODE ]]; then
@@ -2106,9 +2590,17 @@ main() {
     say "Saved to: ${MANUAL_FILE} (password masked)."
   fi
   collect_inputs
-  show_summary
+  build_summary
   if [[ $DRY_RUN != true && $ASSUME_YES != true ]]; then
-    ask_yn "Proceed with these settings?" y || die "Stopped - nothing was changed."
+    if [[ $USE_DIALOG == true ]]; then
+      confirm_summary || { end_dialogs; die "Stopped - nothing was changed."; }
+      end_dialogs; show_summary
+    else
+      show_summary
+      confirm_summary || die "Stopped - nothing was changed."
+    fi
+  else
+    end_dialogs; show_summary
   fi
 
   preflight                                   # 0.1
@@ -2129,11 +2621,17 @@ main() {
     if [[ $MODE == db ]]; then emit_secret_block render_handoff "$HANDOFF_FILE"
     else emit_secret_block render_next_steps "$NEXT_STEPS_FILE"; fi
     say ""
+    say "A real run would also write ${DEFAULT_ENV_FILE} (chmod 600; not written now):"
+    local line
+    while IFS= read -r line; do say "    ${line}"; done < <(render_env "$MASK")
+    git_warning "$DEFAULT_ENV_FILE"
+    say ""
     say "DRY RUN complete - nothing was changed. Steps saved to ${MANUAL_FILE}"
     exit 0
   fi
 
   write_state
+  write_env_file
   local vrc=0
   run_verify || vrc=$?
   say ""
@@ -2141,8 +2639,10 @@ main() {
   say "  Log: ${LOG_FILE}"
   if [[ $MODE == db ]]; then
     emit_secret_block render_handoff "$HANDOFF_FILE"
+    git_warning "$DEFAULT_ENV_FILE" "$HANDOFF_FILE"
   else
     emit_secret_block render_next_steps "$NEXT_STEPS_FILE"
+    git_warning "$DEFAULT_ENV_FILE" "$NEXT_STEPS_FILE"
   fi
   if ((vrc != 0)); then
     err "Setup finished but verification reported FAIL - see the fixes in the table above."
@@ -2150,6 +2650,8 @@ main() {
   fi
 }
 
-if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+# Run main when executed as a file, or as  bash -c "$(curl -fsSL URL)" _ ...
+# (no file: BASH_SOURCE is empty). When the file is sourced, define only.
+if [[ -z ${BASH_SOURCE[0]:-} || ${BASH_SOURCE[0]} == "$0" ]]; then
   main "$@"
 fi

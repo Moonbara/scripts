@@ -117,7 +117,7 @@ USE_DIALOG=false; RESET_CONFIRMED=false
 #     The internal names (MODE, DB_PORT, ...) stay unprefixed.
 declare -A SRC=()
 readonly -a INPUT_VARS=(MODE APP_IP DB_IP DB_PORT DB_NAME DB_USER TIMEZONE WIN_HOSTNAME WIN_IP
-                        IFACE STATIC_IP PREFIX GATEWAY DNS SSH_KEY_FILE)
+                        IFACE STATIC_IP PREFIX GATEWAY DNS SSH_KEY_FILE INSTALL_AGENT)
 for _v in "${INPUT_VARS[@]}"; do
   _e="ZBX_${_v}"
   if [[ -n ${!_e:-} ]]; then printf -v "$_v" '%s' "${!_e}"; SRC[$_v]="environment ${_e}"
@@ -156,6 +156,7 @@ V_ROWS=(); V_FAILS=0; V_WARNS=0
 PF_HINTS=()
 CNF=""; DBC_ARGS=()
 ST_MODE=""; ST_APP_IP=""; ST_DB_IP=""; ST_DB_PORT=""; ST_DB_NAME=""; ST_DB_USER=""; ST_TIMEZONE=""
+ST_INSTALL_AGENT=""
 
 # =============================================================================
 # 1. Output, logging and the run() wrapper
@@ -275,6 +276,7 @@ v_dns() {
 }
 v_username() { [[ $1 =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] && return 0; VERR="lowercase letters, digits, _ and - (max 32)"; return 1; }
 v_path()   { [[ -n $1 && $1 != *[[:cntrl:]]* ]] && return 0; VERR="not a usable path"; return 1; }
+v_yesno()  { [[ ${1,,} == yes || ${1,,} == no ]] && return 0; VERR="must be yes or no"; return 1; }
 normalize_mode() { case ${1,,} in 1) echo single ;; 2) echo db ;; 3) echo app ;; *) echo "${1,,}" ;; esac; }
 TZ_LIST=""
 v_tz() {
@@ -793,6 +795,8 @@ Actions
   --env-file PATH        load ZBX_* values from PATH (default: ./zabbix-setup.env if present)
   --no-env-password      leave ZBX_DB_PASSWORD out of the ./zabbix-setup.env written at the end
   --no-dialog            plain text prompts instead of whiptail dialogs
+  --agent | --no-agent   app/single: install Zabbix Agent 2 on this server, or not
+                         (default yes; it monitors the server itself, not the Windows PC)
   --force                continue on a non-${TARGET_UBUNTU} OS or a role mismatch
   --yes, -y              accept every default, never prompt
   --help, -h             this text
@@ -818,6 +822,7 @@ Values  (priority: flag > environment variable > env file > prompt)
                          given are detected. Applying still needs a yes or --apply-network.
   --mode                 ZBX_MODE
   --ssh-key-file F       ZBX_SSH_KEY_FILE  public key for --add-user
+  --agent / --no-agent   ZBX_INSTALL_AGENT yes|no (app/single; db never installs an agent)
 
 There is no --db-password flag on purpose: it would leak into shell history and ps.
 
@@ -874,6 +879,8 @@ parse_args() {
       --no-env-password)  NO_ENV_PASSWORD=true; shift ;;
       --apply-network)    APPLY_NETWORK=true; shift ;;
       --no-dialog)        NO_DIALOG=true; shift ;;
+      --agent)            INSTALL_AGENT=yes; SRC[INSTALL_AGENT]="flag --agent"; shift ;;
+      --no-agent)         INSTALL_AGENT=no; SRC[INSTALL_AGENT]="flag --no-agent"; shift ;;
       --dry-run)          DRY_RUN=true; shift ;;
       --verify)           DO_VERIFY=true; shift ;;
       --reset)            RESET=true; shift ;;
@@ -898,7 +905,7 @@ declare -rA ENV_VALIDATORS=(
   [MODE]=v_mode [APP_IP]=v_ip [DB_IP]=v_ip [DB_PORT]=v_port [DB_NAME]=v_dbname
   [DB_USER]=v_dbuser [TIMEZONE]=v_tz [WIN_HOSTNAME]=v_winhost [WIN_IP]=v_ip_opt
   [IFACE]=v_iface [STATIC_IP]=v_ip [PREFIX]=v_prefix [GATEWAY]=v_ip [DNS]=v_dns
-  [SSH_KEY_FILE]=v_path [DB_PASSWORD]=v_password
+  [SSH_KEY_FILE]=v_path [DB_PASSWORD]=v_password [INSTALL_AGENT]=v_yesno
 )
 _env_unquote() {   # _env_unquote RAW -> REPLY (outer quotes off, literal)
   local v=$1 q
@@ -964,7 +971,7 @@ load_state() {
   local line key val
   [[ -r $STATE_FILE ]] || return 0
   while IFS= read -r line || [[ -n $line ]]; do
-    [[ $line =~ ^(MODE|APP_IP|DB_IP|DB_PORT|DB_NAME|DB_USER|TIMEZONE)=(.*)$ ]] || continue
+    [[ $line =~ ^(MODE|APP_IP|DB_IP|DB_PORT|DB_NAME|DB_USER|TIMEZONE|INSTALL_AGENT)=(.*)$ ]] || continue
     key=${BASH_REMATCH[1]}; val=${BASH_REMATCH[2]}
     printf -v "ST_${key}" '%s' "$val"
   done <"$STATE_FILE"
@@ -978,6 +985,8 @@ write_state() {
     printf '# zabbix-setup.sh state - non-secret settings of the last successful run (read by --verify)\n'
     printf 'MODE=%s\nAPP_IP=%s\nDB_IP=%s\nDB_PORT=%s\nDB_NAME=%s\nDB_USER=%s\nTIMEZONE=%s\nUPDATED=%s\n' \
       "$MODE" "$APP_IP" "$DB_IP" "$port" "$DB_NAME" "$DB_USER" "$TIMEZONE" "$(date '+%F %T')"
+    # db mode never has the server agent, so only app/single record the choice
+    if [[ $MODE != db ]]; then printf 'INSTALL_AGENT=%s\n' "$INSTALL_AGENT"; fi
   } >"${STATE_FILE}.tmp"
   chmod 600 "${STATE_FILE}.tmp"
   mv -f "${STATE_FILE}.tmp" "$STATE_FILE"
@@ -1180,7 +1189,7 @@ _keep_password() {
 
 collect_inputs() {
   part "Settings (${MODE})"
-  if [[ $ST_MODE != "$MODE" ]]; then ST_APP_IP=""; ST_DB_IP=""; ST_DB_PORT=""; ST_DB_NAME=""; ST_DB_USER=""; fi
+  if [[ $ST_MODE != "$MODE" ]]; then ST_APP_IP=""; ST_DB_IP=""; ST_DB_PORT=""; ST_DB_NAME=""; ST_DB_USER=""; ST_INSTALL_AGENT=""; fi
   static_ip_prompt
   case $MODE in
     db)
@@ -1221,11 +1230,35 @@ collect_inputs() {
   probe_existing_user
   collect_password
   ask TIMEZONE "Timezone:" "${ST_TIMEZONE:-$DEFAULT_TIMEZONE}" v_tz
+  ask_install_agent
   if [[ $MODE != db ]]; then
     ask WIN_HOSTNAME "Windows host name for the printed steps:" "" v_winhost
     ask WIN_IP "Windows IP for the printed steps:" "" v_ip_opt
   fi
   confirm_reset
+}
+
+# INSTALL_AGENT (app/single): Zabbix Agent 2 on this server, which monitors
+# the server itself (the built-in "Zabbix server" host), not the Windows PC.
+# Default yes. Priority flag > environment > env file > prompt; a re-run
+# without any of them offers the previous choice from the state file.
+ask_install_agent() {
+  local def=y q="Install Zabbix Agent 2 on this server (it monitors this server itself, not the Windows PC)?"
+  local src=${SRC[INSTALL_AGENT]:-}
+  if [[ $MODE == db ]]; then
+    [[ -n $src ]] && warn "${src}: ignored - db mode never installs an agent"
+    INSTALL_AGENT=""; return 0
+  fi
+  if [[ -n $src ]]; then
+    if v_yesno "$INSTALL_AGENT"; then
+      INSTALL_AGENT=${INSTALL_AGENT,,}; say "  ${q} ${INSTALL_AGENT}   (from ${src})"; return 0
+    fi
+    warn "INSTALL_AGENT='${INSTALL_AGENT}' from ${src} is invalid: ${VERR}"
+    [[ $ASSUME_YES == true ]] && die "Fix the ${src} value for INSTALL_AGENT and re-run."
+  fi
+  [[ ${ST_INSTALL_AGENT,,} == no ]] && def=n
+  if ask_yn "$q" "$def"; then INSTALL_AGENT=yes; else INSTALL_AGENT=no; fi
+  return 0
 }
 
 # --reset: the only destructive action. Asked here, before anything changes,
@@ -1266,7 +1299,10 @@ build_summary() {   # SUMMARY_LINES - shown as text and in the dialog (password 
                   "  Static IP     : ${net}${STATIC_IP:+ (${STATIC_IP}/${PREFIX} via ${GATEWAY:-?} on ${IFACE:-?})}")
   [[ -n $ADD_USER ]] && SUMMARY_LINES+=("  Admin user    : ${ADD_USER}")
   [[ $RESET == true ]] && SUMMARY_LINES+=("  RESET         : database ${DB_NAME} will be DROPPED and recreated")
-  if [[ $MODE != db ]]; then SUMMARY_LINES+=("  Windows host  : ${WIN_HOSTNAME:-<WIN_HOSTNAME>} / ${WIN_IP:-<WIN_IP>}"); fi
+  if [[ $MODE != db ]]; then
+    SUMMARY_LINES+=("  Agent 2 on this server: ${INSTALL_AGENT}")
+    SUMMARY_LINES+=("  Windows host  : ${WIN_HOSTNAME:-<WIN_HOSTNAME>} / ${WIN_IP:-<WIN_IP>}")
+  fi
   [[ -n $ENV_FILE ]] && SUMMARY_LINES+=("  Env file      : ${ENV_FILE}")
   SUMMARY_LINES+=("  Output files  : ${OUT_DIR}")
   return 0
@@ -1303,7 +1339,7 @@ print_rows() {
   local row st name detail fix color
   for row in "${V_ROWS[@]}"; do
     IFS=$US read -r st name detail fix <<<"$row"
-    case $st in PASS) color=$C_GREEN ;; WARN) color=$C_YELLOW ;; *) color=$C_RED ;; esac
+    case $st in PASS) color=$C_GREEN ;; WARN) color=$C_YELLOW ;; SKIP) color="" ;; *) color=$C_RED ;; esac
     _emit "$color" "$(printf '  %-5s %-44s %s' "$st" "$name" "$detail")"
     if [[ -n $fix && $st != PASS ]]; then say "        fix: ${fix}"; fi
   done
@@ -1843,7 +1879,16 @@ part2_app() {
 
   # ---- 2.2 Packages --------------------------------------------------------------
   step 2.2 "Install Zabbix packages (agent 2, not the classic agent)"
-  apt_install "sudo apt install ${ZBX_PACKAGES[*]} -y" "${ZBX_PACKAGES[@]}"
+  local -a pkgs=()
+  local p
+  for p in "${ZBX_PACKAGES[@]}"; do
+    [[ $p == zabbix-agent2 && $INSTALL_AGENT == no ]] || pkgs+=("$p")
+  done
+  apt_install "sudo apt install ${pkgs[*]} -y" "${pkgs[@]}"
+  if [[ $INSTALL_AGENT == no ]]; then
+    say "      zabbix-agent2 package: (skipped: agent not requested)"
+    if [[ $DRY_RUN != true ]] && pkg_installed zabbix-agent2; then info "Agent 2 was already installed; leaving it as it is"; fi
+  fi
   if [[ $MODE == app ]]; then
     apt_install "sudo apt install mysql-client curl -y   # mysql CLI for step 2.3 (the guide assumes it)" mysql-client curl
   else
@@ -1913,11 +1958,14 @@ part2_app() {
   # ---- 2.7 Services --------------------------------------------------------------
   step 2.7 "Start and enable services"
   [[ $DRY_RUN == true ]] || stop_zabbix_server
-  run systemctl restart zabbix-server zabbix-agent2 apache2 "$PHP_FPM"
-  run systemctl enable zabbix-server zabbix-agent2 apache2 "$PHP_FPM"
+  local -a svcs=()
+  mapfile -t svcs < <(app_services)
+  run systemctl restart "${svcs[@]}"
+  run systemctl enable "${svcs[@]}"
+  if [[ $INSTALL_AGENT == no ]]; then say "      zabbix-agent2 service: (skipped: agent not requested)"; fi
   if [[ $DRY_RUN != true ]]; then
     local s
-    for s in zabbix-server zabbix-agent2 apache2 "$PHP_FPM"; do
+    for s in "${svcs[@]}"; do
       if svc_active "$s"; then ok "${s} active"; else warn "${s} is not active - sudo journalctl -u ${s} -n 50"; fi
     done
     if wait_for_listen "$ZBX_TRAPPER_PORT" 30; then ok "zabbix-server listening on ${ZBX_TRAPPER_PORT}"
@@ -1931,6 +1979,14 @@ part2_app() {
   # ---- 2.8 / 2.9 Manual ----------------------------------------------------------
   step 2.8 "Complete the frontend web wizard - manual, values in NEXT STEPS"
   step 2.9 "Log into the Zabbix website (Admin / zabbix) - manual, see NEXT STEPS"
+}
+
+# The services of steps 2.7 and --verify; zabbix-agent2 only when installed
+# by choice (INSTALL_AGENT=yes). A "no" never stops or removes an agent.
+app_services() {
+  printf '%s\n' zabbix-server
+  if [[ $INSTALL_AGENT != no ]]; then printf '%s\n' zabbix-agent2; fi
+  printf '%s\n' apache2 "$PHP_FPM"
 }
 
 # On stop, zabbix-server first flushes its history cache to the database. If
@@ -2181,6 +2237,7 @@ render_env() {   # render_env PASSWORD_OR_MASK
   _env_kv DB_NAME "$DB_NAME"
   _env_kv DB_USER "$DB_USER"
   _env_kv TIMEZONE "$TIMEZONE"
+  [[ $MODE != db ]] && _env_kv INSTALL_AGENT "$INSTALL_AGENT"
   _env_kv WIN_HOSTNAME "$WIN_HOSTNAME"
   _env_kv WIN_IP "$WIN_IP"
   if [[ $NET_ACTION == configure ]]; then
@@ -2267,6 +2324,13 @@ EOF
    Time zone       ${TIMEZONE}
    Then log in as  Admin / zabbix   and change it IMMEDIATELY:
                    Users > Users > Admin > Change password
+EOF
+  if [[ $INSTALL_AGENT == no ]]; then
+    cat <<EOF
+   Note: the built-in 'Zabbix server' host will show its agent as unavailable, because no agent is installed on this server. Disable that host, or ignore it.
+EOF
+  fi
+  cat <<EOF
 
 2. Windows 11 - install Zabbix agent 2  (guide Part 3, step 1)
    Download from https://www.zabbix.com/download_agents :
@@ -2399,7 +2463,8 @@ verify_db() {
 
 verify_app() {
   local s h p n u pw out m code recent errs
-  for s in zabbix-server zabbix-agent2 apache2 "$PHP_FPM"; do vc_service "$s"; done
+  while IFS= read -r s; do vc_service "$s"; done < <(app_services)
+  if [[ $INSTALL_AGENT == no ]]; then vrow SKIP "service zabbix-agent2 active" "skipped (not installed by choice)"; fi
   vc_listen "$ZBX_TRAPPER_PORT" "zabbix-server" "check ${ZBX_SERVER_LOG}; sudo systemctl restart zabbix-server"
   for m in "${APACHE_MODS[@]}"; do
     if a2query -m "$m" >/dev/null 2>&1; then vrow PASS "Apache module ${m} enabled" ""
@@ -2534,6 +2599,9 @@ resolve_verify_settings() {
     [[ -n $APP_IP ]] || APP_IP=$(mysql_root -e "SELECT host FROM mysql.user WHERE user='${DB_USER}' AND host NOT IN ('localhost','127.0.0.1','::1') LIMIT 1" 2>/dev/null || true)
   fi
   if [[ $MODE == app && -z $DB_IP ]]; then DB_IP=$(kv_get "$ZBX_SERVER_CONF" "" DBHost || true); fi
+  # agent choice: flag/env/env file, else the state file; older state = yes
+  if [[ -n $INSTALL_AGENT ]] && ! v_yesno "$INSTALL_AGENT"; then die "INSTALL_AGENT='${INSTALL_AGENT}' from ${SRC[INSTALL_AGENT]:-?}: ${VERR}"; fi
+  INSTALL_AGENT=${INSTALL_AGENT:-${ST_INSTALL_AGENT:-yes}}; INSTALL_AGENT=${INSTALL_AGENT,,}
   detect_php_fpm >/dev/null
   return 0
 }
@@ -2637,6 +2705,7 @@ main() {
   say ""
   say "  Backups of edited files: ${BACKUP_DIR}$([[ -d $BACKUP_DIR ]] || echo ' (none needed)')"
   say "  Log: ${LOG_FILE}"
+  if [[ $MODE != db ]]; then say "  Agent 2 on this server: ${INSTALL_AGENT}"; fi
   if [[ $MODE == db ]]; then
     emit_secret_block render_handoff "$HANDOFF_FILE"
     git_warning "$DEFAULT_ENV_FILE" "$HANDOFF_FILE"

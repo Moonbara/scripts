@@ -60,11 +60,14 @@ With no options, a menu asks which role the machine has: **1** single VM, **2** 
 | `--add-user NAME` | Create a sudo user and install an SSH public key |
 | `--reset` | Drop and recreate the Zabbix database (db/single only, always asks first) |
 | `--no-dialog` | Plain text prompts instead of whiptail dialogs |
+| `--agent` / `--no-agent` | App/single: install Zabbix Agent 2 on this server, or not (default: yes; see below) |
 | `--force` | Continue on another OS version or a role mismatch |
 | `--yes`, `-y` | Accept every default, no prompts |
 | `--help`, `-h` | Full list, including every value flag |
 
 Values (`--app-ip`, `--db-ip`, `--db-port`, `--db-name`, `--db-user`, `--timezone`, and others) come from, in priority order: a **flag**, a **`ZBX_*` environment variable**, an **env file**, then a **prompt**. There is no password flag on purpose, because it would leak into shell history and `ps`. Pass the password through the hidden prompt, `--db-password-file`, `ZBX_DB_PASSWORD`, or an env file.
+
+**Agent 2 on the server.** In app and single modes the script asks whether to install Zabbix Agent 2 on the server itself (default: yes; key `ZBX_INSTALL_AGENT=yes|no`). That agent only monitors the Zabbix server machine, through the built-in "Zabbix server" host. The Windows PC's agent is a separate, manual install. Answer no and the built-in host shows its agent as unavailable: disable that host or ignore it. A "no" never removes an agent that is already installed. The database server never gets an agent.
 
 ## Documentation
 

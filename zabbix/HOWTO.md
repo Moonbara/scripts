@@ -93,8 +93,9 @@ The script asks, in this order:
 4. **Database name** and **Database user**: both default to `zabbix`.
 5. **DB password (press Enter to generate one)**: typed twice, or Enter for a random 20-character password.
 6. **Timezone**: default `America/Toronto`.
-7. **Windows host name / Windows IP**: optional, only used to fill in the printed Windows steps.
-8. **Summary**: check it, then confirm. Nothing changes before this point.
+7. **Install Zabbix Agent 2 on this server (it monitors this server itself, not the Windows PC)?** Default yes. See [Agent 2 on the server](#agent-2-on-the-server).
+8. **Windows host name / Windows IP**: optional, only used to fill in the printed Windows steps.
+9. **Summary**: check it, then confirm. Nothing changes before this point.
 
 What you should see next:
 
@@ -173,7 +174,7 @@ sudo ./zabbix-setup.sh --mode app --env-file ./zabbix-handoff.txt
 ```
 
 - All database values, the password included, come from the file. Each one is shown as `(from env file ./zabbix-handoff.txt)`, and the password is never asked.
-- It still asks the static IP question, the optional Windows fields and the summary.
+- It still asks the static IP question, whether to install Agent 2 on this server, the optional Windows fields and the summary.
 - It tests the TCP port and the MySQL login, imports the schema (1–2 minutes), configures zabbix-server, Apache, PHP and the locale, then starts the services.
 
 At the end you usually see this, followed by the NEXT STEPS block:
@@ -222,7 +223,7 @@ ZBX_DB_PASSWORD='<password>'
   - Lines starting with `#` and blank lines are ignored.
   - The file is **parsed, never sourced**: `$variables`, `$(commands)` and escapes are taken literally.
   - An unknown key gives a warning. A duplicated key, a malformed line or an invalid value stops the run and names the line number.
-- **Keys:** `ZBX_MODE`, `ZBX_APP_IP`, `ZBX_DB_IP`, `ZBX_DB_PORT`, `ZBX_DB_NAME`, `ZBX_DB_USER`, `ZBX_DB_PASSWORD`, `ZBX_TIMEZONE`, `ZBX_WIN_HOSTNAME`, `ZBX_WIN_IP`, `ZBX_IFACE`, `ZBX_STATIC_IP`, `ZBX_PREFIX`, `ZBX_GATEWAY`, `ZBX_DNS`, `ZBX_SSH_KEY_FILE`.
+- **Keys:** `ZBX_MODE`, `ZBX_APP_IP`, `ZBX_DB_IP`, `ZBX_DB_PORT`, `ZBX_DB_NAME`, `ZBX_DB_USER`, `ZBX_DB_PASSWORD`, `ZBX_TIMEZONE`, `ZBX_WIN_HOSTNAME`, `ZBX_WIN_IP`, `ZBX_IFACE`, `ZBX_STATIC_IP`, `ZBX_PREFIX`, `ZBX_GATEWAY`, `ZBX_DNS`, `ZBX_SSH_KEY_FILE`, `ZBX_INSTALL_AGENT` (`yes` or `no`).
 - **Priority:** flag > `ZBX_*` environment variable > env file > prompt.
 - **Loading:** `--env-file PATH`. Without that flag, `./zabbix-setup.env` is loaded automatically if it exists, and the script says so.
 - **Writing:** every real run (not `--dry-run`) writes `./zabbix-setup.env` with the settings it used, and keeps the previous copy as `zabbix-setup.env.bak`. Add `--no-env-password` to leave the password out.
@@ -324,6 +325,13 @@ The NEXT STEPS block (also in `zabbix-next-steps.txt`) has these steps with your
 - **`--reset`** is the **only destructive option**. It drops and recreates the Zabbix database, on the db or single machine only (app mode refuses).
   - It always asks first, even with `--yes`: a yes/no in dialog mode, then you must **type the database name**.
   - On the db server, stop zabbix-server on the app server first, then re-run app mode to import the schema again. A single VM stops zabbix-server and re-imports on its own.
+- <a id="agent-2-on-the-server"></a>**Agent 2 on the server** (app and single modes):
+  - The script asks whether to install Zabbix Agent 2 on the Zabbix server itself. Default: yes.
+  - That agent only monitors the server machine, through the built-in "Zabbix server" host. It has nothing to do with the Windows PC, whose agent you always install by hand ([section 8](#8-finishing-on-windows-11-manual)).
+  - Choose with `--agent` / `--no-agent`, or `ZBX_INSTALL_AGENT=yes|no` (environment or env file). The choice is saved to `zabbix-setup.env` and `/etc/zabbix-setup.state`, so re-runs and `--verify` remember it.
+  - With **no**: the package is not installed, the service is not touched, and `--verify` shows `SKIP ... skipped (not installed by choice)`. The built-in "Zabbix server" host then shows its agent as unavailable: disable that host or ignore it.
+  - A **no** never removes an agent that is already installed. The run says "Agent 2 was already installed; leaving it as it is".
+  - The database server never gets an agent.
 - **`--add-user NAME`** creates a sudo user:
   - It installs an SSH public key, from `--ssh-key-file` or pasted at the prompt, with `~/.ssh` at 700 and `authorized_keys` at 600.
   - It offers to set a password, which `sudo` needs.
@@ -344,6 +352,7 @@ The NEXT STEPS block (also in `zabbix-next-steps.txt`) has these steps with your
 | Host is grey / "unknown", no data | Host name mismatch, firewall, or agent not restarted | Host name must match `Hostname=` exactly; check `zabbix_agent2.log`; `Test-NetConnection <APP_IP> -Port 10051`; restart "Zabbix Agent 2" |
 | Saving the host fails with `Cannot inherit item with key "agent.hostname" of template "Windows by Zabbix agent" to host "<name>", because a host interface of type "Agent" is required.` (as seen on Zabbix 8.0; the wording may differ slightly between versions) | Template linked, but the host has no Agent interface | *Interfaces > Add > Agent*, `<WIN_IP>` port `10050`, then save again |
 | A re-run pauses about 60 s at step 2.7, then `zabbix-server did not stop within 60 s` | Port or DB IP changed. The old process flushes its cache to a database it can no longer reach | Expected: the script kills it and continues. Unsent history is lost |
+| Built-in "Zabbix server" host: agent unavailable | Installed with `--no-agent` / answered no: there is no agent on the server | Expected. Disable the host (*Data collection > Hosts*), ignore it, or re-run with `--agent` |
 | Wizard: `Locale for language "en_US" is not found` | Locale missing, or PHP-FPM not restarted | `sudo locale-gen en_US.UTF-8 && sudo systemctl restart php8.5-fpm` |
 | Password rejected: `no space at the start or end` | Leading or trailing space (Zabbix trims it in `zabbix_server.conf`) | Remove it; spaces inside are fine |
 | Password rejected: `control characters (tab, newline...) are not supported` / `at least 8 characters` | Tab, other control character, or too short | 8–128 printable characters; anything else, including `' " $ # \ & !`, works |

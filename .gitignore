@@ -1,0 +1,5 @@
+*.env
+*.env.bak
+zabbix-handoff.txt
+zabbix-next-steps.txt
+zabbix-manual-steps.txt

@@ -42,6 +42,7 @@ sudo bash -c 'bash <(curl -fsSL https://raw.githubusercontent.com/Moonbara/scrip
 ```
 
 - **Not `bash -c "$(curl ...)"`.** That older form passes the whole script as one argument, and Linux refuses arguments over 128 KiB. The script is bigger than that, so the run stops with "Argument list too long".
+- **Not `sudo bash <(curl ...)` either.** sudo closes the pipe `<( )` creates (`/dev/fd/63: No such file or directory`). The short form works only in a root shell: `sudo -i`, then `bash <(curl -fsSL <URL>) --mode db`.
 
 - **Pin a version.** Replace `main` in the URL with a tag or a commit hash, for example `zabbix-v1.1.1`, so the code you run cannot change underneath you.
 - **This means trusting the repository.** Piping a script from the internet into a root shell runs whatever that URL serves at that moment. Read it first, or download it and run the local copy:
@@ -80,6 +81,19 @@ sudo ufw allow from <APP_IP> to any port <DB_PORT> proto tcp
 ```
 (Skip this if `ufw status` shows `inactive`.)
 > The rule only lets the app server in, matching the MySQL user below, which is scoped to `<APP_IP>`. A plain `ufw allow <DB_PORT>/tcp` would open the port to every host.
+
+To turn the firewall **on** (what the script does in this step), always allow SSH first. Use the port sshd really listens on (`sudo sshd -T | grep ^port`), or you lock yourself out:
+```bash
+sudo apt install ufw -y
+sudo ufw allow 22/tcp comment 'zabbix-setup'                                              # SSH - FIRST
+sudo ufw allow from <APP_IP> to any port <DB_PORT> proto tcp comment 'zabbix-setup'
+sudo ufw allow from <APP_IP> to any port 10050 proto tcp comment 'zabbix-setup'          # only with Agent 2 (step 6)
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw --force enable
+sudo ufw status numbered
+```
+> Changing the firewall over SSH can cut the connection. With the SSH rule in place first, `ufw --force enable` keeps your session. `ufw reset` is never needed: it would throw away your own rules too.
 
 ### 4. Create the database and user
 ```bash
@@ -127,7 +141,7 @@ Hostname=<AGENT_HOSTNAME>
 ```bash
 sudo systemctl enable zabbix-agent2
 sudo systemctl restart zabbix-agent2
-sudo ufw allow from <APP_IP> to any port 10050 proto tcp    # only if ufw is active
+sudo ufw allow from <APP_IP> to any port 10050 proto tcp comment 'zabbix-setup'    # if not already done in step 3
 ```
 Once Part 2 is done, add it in the web UI under **Data collection → Hosts → Create host**:
 - Host name: `<AGENT_HOSTNAME>` (must match `Hostname=` exactly)
@@ -233,17 +247,23 @@ sudo systemctl enable zabbix-server zabbix-agent2 apache2 php8.5-fpm
 > `sudo timeout 60 systemctl stop zabbix-server || sudo systemctl kill --signal=SIGKILL zabbix-server`
 
 ### 7a. Open the firewall for the web UI and active checks
-If `ufw` is active on the app server, allow the web UI and the agents' active checks:
+Allow SSH first, then the web UI and the agents' active checks, then turn ufw on (the script does exactly this):
 ```bash
-sudo ufw status
-sudo ufw allow 80/tcp       # web UI
-sudo ufw allow 10051/tcp    # active checks from the Windows agent (ServerActive=)
+sudo apt install ufw -y
+sudo ufw allow 22/tcp comment 'zabbix-setup'                                             # SSH - FIRST (your real sshd port)
+sudo ufw allow 80/tcp comment 'zabbix-setup'                                             # web UI
+sudo ufw allow from <WIN_IP> to any port 10051 proto tcp comment 'zabbix-setup'         # active checks (ServerActive=)
+#   (no Windows IP known yet: sudo ufw allow 10051/tcp comment 'zabbix-setup')
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw --force enable
+sudo ufw status numbered
 ```
-(Skip this if `ufw status` shows `inactive`.)
+If `ufw` was already active, only the `allow` lines are needed.
 
 ### 8. Complete the frontend web wizard
 Go to `http://<APP_IP>/zabbix`:
-- Database host: `<DB_IP>`
+- Database host: `<DB_IP>`: the **database** server, not localhost and not the Zabbix server. A host name only works if the app server can resolve it (DNS or `/etc/hosts`); otherwise the wizard fails with `getaddrinfo ... Name or service not known`, so the IP is the safe choice.
 - Database port: `<DB_PORT>` (must be set explicitly here — leaving it `0` makes the wizard assume the default port 3306, which will fail since MySQL is listening on `<DB_PORT>` instead)
 - Database name: `zabbix`
 - User / Password: `zabbix` / `<DB_PASSWORD>`
@@ -333,6 +353,14 @@ Check **Monitoring → Latest data** filtered to `<WIN_HOSTNAME>` — CPU, memor
   - **Full output:** the commands' output (apt, mysql, systemctl…) goes to `/var/log/zabbix-setup.log`, never with the password. A failed step stays red, with its last 15 lines, the error, the fix from the Troubleshooting table above, and the log path.
   - **`--verbose` / `-v`** (or `ZBX_VERBOSE=1`): every command as `$ ...`, with its live output underneath.
   - **Piped output:** plain `[..]` / `[OK]` / `[FAIL]` lines. `NO_COLOR=1` / `TERM=dumb` turn off colours and the redraw.
+- **Verbose** is the first question ("Show detailed output (verbose)?", default no), unless `--verbose` / `-v` or `ZBX_VERBOSE=yes|no` already answers it. The answer goes into `zabbix-setup.env`, never into the hand-off.
+- **Firewall:** the script **enables ufw** in Part 1 step 3 (db) and Part 2 step 7a (app, single), with the commands shown in those steps:
+  - The exact rule list is shown first, then the question "Enable the ufw firewall with these rules?" (default yes).
+  - SSH is always allowed first. Without a detectable SSH port, ufw is not enabled, not even with `--force`, unless `--ssh-port N` names it.
+  - A rule that already exists without the comment is left alone and reported as "already present (not managed by the script)".
+  - Rules carry the comment `zabbix-setup`. A re-run adds nothing twice and replaces only those rules when the DB port or an IP changed.
+  - `--no-ufw` / `ZBX_ENABLE_UFW=no` skip it. `--verify` checks it.
+- **The last block of every run**, also saved at the end of `zabbix-next-steps.txt` / `zabbix-handoff.txt`, is **REMEMBER: ZABBIX WEB WIZARD**. It holds the values for step 8, the password (printed only there), and the reminder to change the Admin / zabbix web login, which is a different account from the database user.
 - **`--env-file PATH`** loads `ZBX_*` settings from a file (`ZBX_DB_IP=...`, `ZBX_DB_PORT=...`, `ZBX_DB_PASSWORD='...'`). The DB server's `zabbix-handoff.txt` is such a file: copy it to the app server with `scp` and pass it with `--env-file`. Each run also writes `./zabbix-setup.env` (chmod 600) and reads it back automatically on the next run in the same directory. Priority: flag > `ZBX_*` environment variable > env file > prompt.
 - The env file, `zabbix-handoff.txt` and `zabbix-next-steps.txt` contain the DB password: keep them chmod 600 and out of git.
 - Single VM with a custom MySQL port (`--db-port`): Zabbix then connects over TCP to `127.0.0.1:<port>`, and the wizard's Database host is `127.0.0.1`. `localhost` would make the MySQL client use the socket and ignore the port.

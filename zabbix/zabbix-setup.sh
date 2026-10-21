@@ -30,6 +30,10 @@
 #                 0.4 time sync + timezone
 #    1.6          optional Agent 2 on the database server (db mode)
 #    2.5a / 2.7a  extra sub-steps: PHP timezone, firewall for web + agents
+#  Firewall: step 1.3 (db) / 2.7a (app, single) ENABLES ufw after a yes to
+#  the listed rules - SSH first - unless --no-ufw / ZBX_ENABLE_UFW=no.
+#  Every run ends with the REMEMBER: ZABBIX WEB WIZARD block (the password
+#  is printed only there).
 #
 #  Map of this file:
 #     0. constants and defaults        6. Part 0 (steps 0.2 - 0.4)
@@ -45,7 +49,7 @@ umask 022
 # =============================================================================
 # 0. Constants and defaults - the only place versions, ports and paths live
 # =============================================================================
-readonly SCRIPT_VERSION="1.3.0"
+readonly SCRIPT_VERSION="1.5.0"
 # Optional: where the script is published. Only used to print the one-line
 # launch command (leave it empty to print <URL> instead). Pin a tag or a
 # commit instead of main for anything you rely on.
@@ -80,6 +84,7 @@ readonly MYSQLD_CNF="/etc/mysql/mysql.conf.d/mysqld.cnf"
 readonly ZBX_SERVER_CONF="/etc/zabbix/zabbix_server.conf"
 readonly ZBX_AGENT_CONF="/etc/zabbix/zabbix_agent2.conf"
 readonly ZBX_DEFAULT_AGENT_HOST="Zabbix server"   # package default = the built-in host
+readonly UFW_COMMENT="zabbix-setup"   # every ufw rule this script adds carries it
 readonly ZBX_SERVER_LOG="/var/log/zabbix/zabbix_server.log"
 readonly ZBX_APACHE_CONF="/etc/zabbix/apache.conf"
 readonly ZBX_PHP_POOL_GUESS="/etc/zabbix/php-fpm.conf"
@@ -129,7 +134,7 @@ USE_DIALOG=false; RESET_CONFIRMED=false
 #     The internal names (MODE, DB_PORT, ...) stay unprefixed.
 declare -A SRC=()
 readonly -a INPUT_VARS=(MODE APP_IP DB_IP DB_PORT DB_NAME DB_USER TIMEZONE WIN_HOSTNAME WIN_IP
-                        IFACE STATIC_IP PREFIX GATEWAY DNS SSH_KEY_FILE INSTALL_AGENT AGENT_HOSTNAME VERBOSE)
+                        IFACE STATIC_IP PREFIX GATEWAY DNS SSH_KEY_FILE INSTALL_AGENT AGENT_HOSTNAME VERBOSE ENABLE_UFW SSH_PORT)
 for _v in "${INPUT_VARS[@]}"; do
   _e="ZBX_${_v}"
   if [[ -n ${!_e:-} ]]; then printf -v "$_v" '%s' "${!_e}"; SRC[$_v]="environment ${_e}"
@@ -168,7 +173,8 @@ V_ROWS=(); V_FAILS=0; V_WARNS=0
 PF_HINTS=()
 CNF=""; DBC_ARGS=()
 ST_MODE=""; ST_APP_IP=""; ST_DB_IP=""; ST_DB_PORT=""; ST_DB_NAME=""; ST_DB_USER=""; ST_TIMEZONE=""
-ST_INSTALL_AGENT=""; ST_AGENT_HOSTNAME=""
+ST_INSTALL_AGENT=""; ST_AGENT_HOSTNAME=""; ST_ENABLE_UFW=""; ST_SSH_PORT=""
+SSH_PORTS=(); SSH_PORT_SRC=""; UFW_RULES=()
 
 # =============================================================================
 # 1. Output, logging and the run() wrapper
@@ -200,7 +206,7 @@ UI_REDRAW=false          # in-place line + spinner (terminal, colours allowed)
 UI_PAUSE=0               # >0 while a question or netplan try has the terminal
 INTERRUPTED=""           # INT / TERM / HUP received
 STEP_FILE=""             # progress/plain: the current step's output (mode 600)
-STEP_ON=false; STEP_NUM=""; STEP_TITLE=""; STEP_T0=0; STEP_STATUS=""; STEP_NOTE=""
+STEP_ON=false; STEP_NUM=""; STEP_TITLE=""; STEP_T0=0; STEP_STATUS=""; STEP_NOTE=""; STEP_INFO=""
 STEP_INSTALLED=false     # apt_install installed something in this step
 STEP_SHOWN=0             # bytes of STEP_FILE already shown above a question
 STEP_HEADED=false        # that question already has the step header above it
@@ -340,13 +346,6 @@ ui_init() {      # after flags and the env file: pick the display mode
   trap 'on_signal 143 TERM' TERM
   trap 'on_signal 129 HUP' HUP
 }
-ui_mode_text() {  # for the settings summary
-  case $UI in
-    verbose)  printf 'verbose - every command and its output (from %s)' "${SRC[VERBOSE]:-?}" ;;
-    progress) printf 'one line per step (--verbose shows every command)' ;;
-    plain)    printf 'plain lines (output is not a terminal)' ;;
-  esac
-}
 on_signal() { INTERRUPTED=$2; trap - INT TERM HUP; exit "$1"; }
 
 # NOW = seconds since boot (/proc/uptime): monotonic, so step 0.4 (chrony
@@ -395,7 +394,7 @@ ui_line_start() {  # the line of a running step: redrawn with a spinner, or prin
 step_begin() {
   _now
   STEP_ON=true; STEP_NUM=$1; STEP_TITLE=$2; STEP_T0=$NOW
-  STEP_STATUS=ok; STEP_NOTE=""; STEP_INSTALLED=false; STEP_HEADED=false
+  STEP_STATUS=ok; STEP_NOTE=""; STEP_INFO=""; STEP_INSTALLED=false; STEP_HEADED=false
   STEP_N=$((STEP_N + 1))
   ((RUN_T0 >= 0)) || RUN_T0=$NOW
   [[ -n $STEP_FILE ]] || return 0      # --verbose: the header above is the title
@@ -405,6 +404,8 @@ step_begin() {
 }
 # step_skip REASON - the step had nothing to do: [-] ... (skipped: REASON)
 step_skip() { STEP_STATUS=skip; STEP_NOTE=$1; }
+# step_info TEXT - a short result shown after the duration: [✓] ... (3s; TEXT)
+step_info() { STEP_INFO=$1; }
 _step_detach() {   # spinner off, fds 1/2 back to the terminal
   [[ -n $STEP_FILE ]] || return 0
   spin_stop
@@ -446,7 +447,7 @@ step_close() {     # end the current step: [✓] or [-], its warnings, the log
   if [[ $STEP_STATUS == skip ]]; then
     line="$(_step_lead "$M_SKIP") (skipped: ${STEP_NOTE})"; color=$C_YELLOW; word=SKIP
   else
-    line="$(_step_lead "$M_OK") (${dur})"; color=$C_GREEN; word=OK
+    line="$(_step_lead "$M_OK") (${dur}${STEP_INFO:+; ${STEP_INFO}})"; color=$C_GREEN; word=OK
   fi
   _step_detach
   printf '%s%s%s\n' "$color" "$line" "${color:+$C_OFF}" >&7
@@ -599,6 +600,10 @@ v_port() {
   if [[ $1 =~ ^[1-9][0-9]{3,4}$ ]] && ((10#$1 >= 1024 && 10#$1 <= 65535)); then return 0; fi
   VERR="port must be a number from 1024 to 65535"; return 1
 }
+v_ssh_port() {   # 1-65535 (SSH may well run below 1024)
+  if [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && ((10#$1 <= 65535)); then return 0; fi
+  VERR="SSH port must be a number from 1 to 65535"; return 1
+}
 v_dbname() { [[ $1 =~ ^[A-Za-z0-9_]{1,64}$ ]] && return 0; VERR="use only letters, digits and _ (max 64)"; return 1; }
 v_dbuser() { [[ $1 =~ ^[A-Za-z0-9_]{1,32}$ ]] && return 0; VERR="use only letters, digits and _ (max 32)"; return 1; }
 v_winhost() {
@@ -617,7 +622,7 @@ v_dns() {
 v_username() { [[ $1 =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] && return 0; VERR="lowercase letters, digits, _ and - (max 32)"; return 1; }
 v_path()   { [[ -n $1 && $1 != *[[:cntrl:]]* ]] && return 0; VERR="not a usable path"; return 1; }
 v_yesno()  { [[ ${1,,} == yes || ${1,,} == no ]] && return 0; VERR="must be yes or no"; return 1; }
-v_verbose() { [[ -z $1 || ${1,,} =~ ^(0|1|yes|no|true|false)$ ]] && return 0; VERR="must be 1 (verbose) or 0"; return 1; }
+v_verbose() { [[ -z $1 || ${1,,} =~ ^(0|1|yes|no|true|false)$ ]] && return 0; VERR="must be yes or no"; return 1; }
 # Agent host name (Hostname= in zabbix_agent2.conf): no spaces, except the
 # package default "Zabbix server" that matches the built-in host.
 v_agent_host() {
@@ -725,7 +730,11 @@ ask_yn() {
     [[ $def == y ]] || dopt=(--defaultno)
     text=$q
     if [[ -n $extra ]]; then text="${extra}"$'\n\n'"${q}"; fi
-    if _dlg --title "Question" "${dopt[@]}" --yesno "$text" 16 76; then
+    # height: 16, or more for a long text (e.g. the ufw rule list), at most 24
+    local h=7 l
+    while IFS= read -r l; do h=$((h + 1 + ${#l} / 72)); done <<<"$text"
+    ((h < 16)) && h=16; ((h > 24)) && h=24
+    if _dlg --title "Question" "${dopt[@]}" --yesno "$text" "$h" 76; then
       _record "  ${q} -> yes"; ui_resume; return 0
     fi
     _record "  ${q} -> no"; ui_resume; return 1
@@ -922,10 +931,103 @@ give_to_sudo_user() {
 pkg_installed() { [[ $(dpkg-query -W -f='${Status}' "$1" 2>/dev/null || true) == "install ok installed" ]]; }
 svc_active()    { systemctl is-active --quiet "$1" 2>/dev/null; }
 
-ufw_state() {     # prints active | inactive | absent  (never enables ufw)
+ufw_state() {     # prints active | inactive | absent  (read only)
   if ! command -v ufw >/dev/null 2>&1; then echo absent; return 0; fi
   local out; out=$(ufw status 2>/dev/null || true)
   if [[ $out == *"Status: active"* ]]; then echo active; else echo inactive; fi
+}
+
+# SSH_PORTS - the port(s) sshd really listens on, so the ufw step can allow
+# them before it enables the firewall. sshd -T first, then ss -ltnp (sshd, or
+# systemd for the socket-activated ssh.socket), then sshd_config (Port lines,
+# default 22). --ssh-port / ZBX_SSH_PORT adds one explicitly (the port you
+# connect with, e.g. behind a NAT forward). None found and no --ssh-port:
+# empty, and ufw is not enabled (--force does not change that).
+_ssh_port_add() {
+  local p
+  [[ $1 =~ ^[0-9]+$ ]] || return 0
+  for p in "${SSH_PORTS[@]}"; do [[ $p == "$1" ]] && return 0; done
+  SSH_PORTS+=("$1")
+}
+detect_ssh_ports() {
+  _detect_ssh_ports_auto
+  if [[ -n $SSH_PORT ]] && v_ssh_port "$SSH_PORT"; then
+    _ssh_port_add "$SSH_PORT"
+    if [[ -n $SSH_PORT_SRC ]]; then SSH_PORT_SRC+=" + ${SRC[SSH_PORT]:-saved} (${SSH_PORT})"
+    else SSH_PORT_SRC="${SRC[SSH_PORT]:-saved --ssh-port} (not detected)"; fi
+  fi
+  return 0
+}
+_detect_ssh_ports_auto() {
+  SSH_PORTS=(); SSH_PORT_SRC=""
+  local out k v line f
+  local -a cols=()
+  if command -v sshd >/dev/null 2>&1 && out=$(sshd -T 2>/dev/null); then
+    while read -r k v _; do [[ $k == port ]] && _ssh_port_add "$v"; done <<<"$out"
+    if ((${#SSH_PORTS[@]})); then SSH_PORT_SRC="sshd -T"; return 0; fi
+  fi
+  out=$(ss -ltnpH 2>/dev/null || true)
+  while IFS= read -r line; do
+    [[ $line == *'"sshd'* ]] || continue
+    read -r -a cols <<<"$line"
+    ((${#cols[@]} >= 4)) && _ssh_port_add "${cols[3]##*:}"
+  done <<<"$out"
+  if [[ -z ${SSH_PORTS[*]} ]] && systemctl is-active --quiet ssh.socket 2>/dev/null; then
+    out=$(systemctl show -p Listen --value ssh.socket 2>/dev/null || true)
+    for k in $out; do [[ $k == *:* ]] && _ssh_port_add "${k##*:}"; done
+  fi
+  if ((${#SSH_PORTS[@]})); then SSH_PORT_SRC="ss -ltnp"; return 0; fi
+  if [[ -r /etc/ssh/sshd_config ]]; then
+    for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
+      [[ -r $f ]] || continue
+      while read -r k v _; do [[ ${k,,} == port ]] && _ssh_port_add "$v"; done <"$f"
+    done
+    ((${#SSH_PORTS[@]})) || SSH_PORTS=(22)
+    SSH_PORT_SRC="/etc/ssh/sshd_config"
+    return 0
+  fi
+  return 0
+}
+
+# UFW_RULES - the rules the ufw step adds, as ufw arguments, SSH first.
+#   db:         DB_PORT and (agent) 10050, only from APP_IP
+#   app/single: 80/tcp (web UI), 10051/tcp (active checks; only from WIN_IP if given)
+ufw_plan() {
+  local p c="comment ${UFW_COMMENT}"
+  UFW_RULES=()
+  for p in "${SSH_PORTS[@]}"; do UFW_RULES+=("allow ${p}/tcp ${c}"); done
+  case $MODE in
+    db)
+      UFW_RULES+=("allow from ${APP_IP} to any port ${DB_PORT} proto tcp ${c}")
+      if [[ $INSTALL_AGENT == yes ]]; then UFW_RULES+=("allow from ${APP_IP} to any port ${ZBX_AGENT_PORT} proto tcp ${c}"); fi ;;
+    app|single)
+      UFW_RULES+=("allow ${HTTP_PORT}/tcp ${c}")
+      if [[ -n $WIN_IP && $WIN_IP != "<"* ]]; then UFW_RULES+=("allow from ${WIN_IP} to any port ${ZBX_TRAPPER_PORT} proto tcp ${c}")
+      else UFW_RULES+=("allow ${ZBX_TRAPPER_PORT}/tcp ${c}"); fi ;;
+  esac
+  return 0
+}
+_ufw_shown() {   # _ufw_shown RULE -> "sudo ufw RULE" with the comment quoted as typed by hand
+  local r=${1% comment "$UFW_COMMENT"}
+  [[ $r != "$1" ]] && r+=" comment '${UFW_COMMENT}'"
+  printf 'sudo ufw %s' "$r"
+}
+ufw_plan_lines() {   # the commands of the ufw step, in order (for the question and --dry-run)
+  local r
+  if [[ $DRY_RUN == true ]] || ! command -v ufw >/dev/null 2>&1; then printf '%s\n' "sudo apt install ufw -y   (if missing)"; fi
+  if ((${#SSH_PORTS[@]} == 0)); then printf '%s\n' "(no SSH port detected: ufw is not enabled)"; return 0; fi
+  for r in "${UFW_RULES[@]}"; do printf '%s\n' "$(_ufw_shown "$r")"; done
+  printf '%s\n' "sudo ufw default deny incoming     (if ufw is not active yet)" \
+                "sudo ufw default allow outgoing" "sudo ufw --force enable"
+}
+# The rules ufw holds (also while inactive), as "allow ... comment zabbix-setup"
+ufw_added_rules() {
+  local line
+  while IFS= read -r line; do
+    [[ $line == "ufw "* ]] || continue
+    line=${line#ufw }; printf '%s\n' "${line//\'/}"
+  done < <(ufw show added 2>/dev/null || true)
+  return 0
 }
 
 read_os() {
@@ -1151,7 +1253,15 @@ Actions
                          app/single: it monitors the server itself, not the Windows PC;
                          db: it lets the Zabbix server monitor the database server
   --verbose, -v          show every command (\$ ...) and its live output under each step
-                         (default: one line per step - [✗] while running, [✓] done, [-] skipped)
+                         (default: one line per step - [✗] while running, [✓] done, [-] skipped;
+                         without the flag the script asks "Show detailed output (verbose)?")
+  --no-ufw               do not enable the ufw firewall (rules are then only added when
+                         ufw is already active). Default: the firewall step (db 1.3,
+                         app/single 2.7a) installs ufw, allows SSH FIRST, then the role's
+                         ports (comment 'zabbix-setup'), sets deny incoming / allow
+                         outgoing and enables it - after a yes to the rule list.
+                         No SSH port detected: ufw is NOT enabled (not even with
+                         --force) unless --ssh-port N names the port you connect with
   --force                continue on a non-${TARGET_UBUNTU} OS or a role mismatch
   --yes, -y              accept every default, never prompt
   --help, -h             this text
@@ -1170,17 +1280,21 @@ Values  (priority: flag > environment variable > env file > prompt)
                                            (DB_PASSWORD still works but is deprecated)
   --timezone TZ          ZBX_TIMEZONE      default ${DEFAULT_TIMEZONE}
   --win-hostname NAME    ZBX_WIN_HOSTNAME  only used in the printed Windows steps
-  --win-ip IP            ZBX_WIN_IP        only used in the printed Windows steps
+  --win-ip IP            ZBX_WIN_IP        the printed Windows steps; with ufw, 10051 is
+                                           allowed from this IP only
   --iface IF  --static-ip IP  --prefix N  --gateway IP  --dns IP[,IP]
                          ZBX_IFACE ZBX_STATIC_IP ZBX_PREFIX ZBX_GATEWAY ZBX_DNS  (step 0.3)
                          --static-ip selects "configure" without asking; values not
                          given are detected. Applying still needs a yes or --apply-network.
   --mode                 ZBX_MODE
   --ssh-key-file F       ZBX_SSH_KEY_FILE  public key for --add-user
+  --ssh-port N           ZBX_SSH_PORT      SSH port to allow in ufw (1-65535), added to the
+                                           detected one; required when none is detected
   --agent / --no-agent   ZBX_INSTALL_AGENT yes|no
   --agent-hostname NAME  ZBX_AGENT_HOSTNAME Hostname= of that agent (= host name in the web UI);
                                            db default: hostname -s; app/single: Zabbix server
-  --verbose / -v         ZBX_VERBOSE       1 = verbose output, 0 = one line per step (default)
+  --verbose / -v         ZBX_VERBOSE       yes = verbose output, no = one line per step (default)
+  --no-ufw               ZBX_ENABLE_UFW    yes (default) | no
 
 There is no --db-password flag on purpose: it would leak into shell history and ps.
 
@@ -1243,6 +1357,7 @@ parse_args() {
       --gateway)          _setv GATEWAY "$@"; shift 2 ;;
       --dns)              _setv DNS "$@"; shift 2 ;;
       --ssh-key-file)     _setv SSH_KEY_FILE "$@"; shift 2 ;;
+      --ssh-port)         _setv SSH_PORT "$@"; shift 2 ;;
       --db-password-file) _need "$@"; PW_FILE=$2; shift 2 ;;
       --add-user)         _need "$@"; ADD_USER=$2; shift 2 ;;
       --env-file)         _need "$@"; ENV_FILE=$2; shift 2 ;;
@@ -1252,7 +1367,8 @@ parse_args() {
       --agent)            INSTALL_AGENT=yes; SRC[INSTALL_AGENT]="flag --agent"; shift ;;
       --no-agent)         INSTALL_AGENT=no; SRC[INSTALL_AGENT]="flag --no-agent"; shift ;;
       --agent-hostname)   _setv AGENT_HOSTNAME "$@"; shift 2 ;;
-      --verbose|-v)       VERBOSE=1; SRC[VERBOSE]="flag $1"; shift ;;
+      --verbose|-v)       VERBOSE=yes; SRC[VERBOSE]="flag $1"; shift ;;
+      --no-ufw)           ENABLE_UFW=no; SRC[ENABLE_UFW]="flag --no-ufw"; shift ;;
       --dry-run)          DRY_RUN=true; shift ;;
       --verify)           DO_VERIFY=true; shift ;;
       --reset)            RESET=true; shift ;;
@@ -1277,8 +1393,8 @@ declare -rA ENV_VALIDATORS=(
   [MODE]=v_mode [APP_IP]=v_ip [DB_IP]=v_ip [DB_PORT]=v_port [DB_NAME]=v_dbname
   [DB_USER]=v_dbuser [TIMEZONE]=v_tz [WIN_HOSTNAME]=v_winhost [WIN_IP]=v_ip_opt
   [IFACE]=v_iface [STATIC_IP]=v_ip [PREFIX]=v_prefix [GATEWAY]=v_ip [DNS]=v_dns
-  [SSH_KEY_FILE]=v_path [DB_PASSWORD]=v_password [INSTALL_AGENT]=v_yesno [AGENT_HOSTNAME]=v_agent_host
-  [VERBOSE]=v_verbose
+  [SSH_KEY_FILE]=v_path [SSH_PORT]=v_ssh_port [DB_PASSWORD]=v_password [INSTALL_AGENT]=v_yesno [AGENT_HOSTNAME]=v_agent_host
+  [VERBOSE]=v_verbose [ENABLE_UFW]=v_yesno
 )
 _env_unquote() {   # _env_unquote RAW -> REPLY (outer quotes off, literal)
   local v=$1 q
@@ -1344,7 +1460,7 @@ load_state() {
   local line key val
   [[ -r $STATE_FILE ]] || return 0
   while IFS= read -r line || [[ -n $line ]]; do
-    [[ $line =~ ^(MODE|APP_IP|DB_IP|DB_PORT|DB_NAME|DB_USER|TIMEZONE|INSTALL_AGENT|AGENT_HOSTNAME)=(.*)$ ]] || continue
+    [[ $line =~ ^(MODE|APP_IP|DB_IP|DB_PORT|DB_NAME|DB_USER|TIMEZONE|INSTALL_AGENT|AGENT_HOSTNAME|ENABLE_UFW|SSH_PORT)=(.*)$ ]] || continue
     key=${BASH_REMATCH[1]}; val=${BASH_REMATCH[2]}
     printf -v "ST_${key}" '%s' "$val"
   done <"$STATE_FILE"
@@ -1360,6 +1476,8 @@ write_state() {
       "$MODE" "$APP_IP" "$DB_IP" "$port" "$DB_NAME" "$DB_USER" "$TIMEZONE" "$(date '+%F %T')"
     # the Agent 2 choice (all modes) and, when installed, its host name
     printf 'INSTALL_AGENT=%s\n' "$INSTALL_AGENT"
+    printf 'ENABLE_UFW=%s\n' "$ENABLE_UFW"   # read by --verify (ufw checks)
+    if [[ -n $SSH_PORT ]]; then printf 'SSH_PORT=%s\n' "$SSH_PORT"; fi
     if [[ $INSTALL_AGENT == yes ]]; then printf 'AGENT_HOSTNAME=%s\n' "$AGENT_HOSTNAME"; fi
   } >"${STATE_FILE}.tmp"
   chmod 600 "${STATE_FILE}.tmp"
@@ -1563,7 +1681,8 @@ _keep_password() {
 
 collect_inputs() {
   part "Settings (${MODE})"
-  if [[ $ST_MODE != "$MODE" ]]; then ST_APP_IP=""; ST_DB_IP=""; ST_DB_PORT=""; ST_DB_NAME=""; ST_DB_USER=""; ST_INSTALL_AGENT=""; ST_AGENT_HOSTNAME=""; fi
+  if [[ $ST_MODE != "$MODE" ]]; then ST_APP_IP=""; ST_DB_IP=""; ST_DB_PORT=""; ST_DB_NAME=""; ST_DB_USER=""; ST_INSTALL_AGENT=""; ST_AGENT_HOSTNAME=""; ST_ENABLE_UFW=""; fi
+  ask_verbose
   static_ip_prompt
   case $MODE in
     db)
@@ -1607,9 +1726,55 @@ collect_inputs() {
   ask_install_agent
   if [[ $MODE != db ]]; then
     ask WIN_HOSTNAME "Windows host name for the printed steps:" "" v_winhost
-    ask WIN_IP "Windows IP for the printed steps:" "" v_ip_opt
+    ask WIN_IP "Windows IP for the printed steps (also limits ufw port ${ZBX_TRAPPER_PORT} to it; Enter = any):" "" v_ip_opt
   fi
+  ask_enable_ufw
   confirm_reset
+}
+
+# VERBOSE: every command and its live output instead of one line per step.
+# Priority flag > environment > env file > prompt; default no. Not asked in
+# --dry-run (its output does not change).
+ask_verbose() {
+  local src=${SRC[VERBOSE]:-} q="Show detailed output (verbose)?"
+  if [[ -n $src ]]; then
+    v_verbose "$VERBOSE" || die "VERBOSE='${VERBOSE}' from ${src} is invalid: ${VERR}"
+    case ${VERBOSE,,} in 1|yes|true) VERBOSE=yes ;; *) VERBOSE=no ;; esac
+    say "  ${q} ${VERBOSE}   (from ${src})"
+    return 0
+  fi
+  if [[ $DRY_RUN == true ]]; then VERBOSE=no; return 0; fi
+  if ask_yn "$q" n "yes: every command and its output under each step.  no: one line per step (the full output still goes to ${LOG_FILE})."; then
+    VERBOSE=yes
+  else
+    VERBOSE=no
+  fi
+  return 0
+}
+
+# ENABLE_UFW: the firewall step (db: 1.3, app/single: 2.7a) installs ufw,
+# adds the rules below (SSH first) and enables it. no (--no-ufw,
+# ZBX_ENABLE_UFW=no): rules are only added when ufw is already active, as
+# before. The question shows the exact commands.
+ask_enable_ufw() {
+  local src=${SRC[ENABLE_UFW]:-} q="Enable the ufw firewall with these rules?" text l def=y
+  if [[ -n $SSH_PORT ]] && ! v_ssh_port "$SSH_PORT"; then die "SSH_PORT='${SSH_PORT}' from ${SRC[SSH_PORT]:-?} is invalid: ${VERR}"; fi
+  detect_ssh_ports
+  ufw_plan
+  if [[ -n $src ]]; then
+    v_yesno "$ENABLE_UFW" || die "ENABLE_UFW='${ENABLE_UFW}' from ${src} is invalid: ${VERR}"
+    ENABLE_UFW=${ENABLE_UFW,,}
+    say "  ${q} ${ENABLE_UFW}   (from ${src})"
+    return 0
+  fi
+  text="The firewall step would run, in this order:"
+  say "  ${text}"
+  while IFS= read -r l; do say "      ${l}"; text+=$'\n'"  ${l}"; done < <(ufw_plan_lines)
+  if ((${#SSH_PORTS[@]} == 0)); then
+    warn "No SSH port detected - ufw will NOT be enabled (it could lock you out). Pass --ssh-port N (the port you connect with) to enable it; --force does not."
+  fi
+  if ask_yn "$q" "$def" "$text"; then ENABLE_UFW=yes; else ENABLE_UFW=no; fi
+  return 0
 }
 
 # INSTALL_AGENT: Zabbix Agent 2 on this server. app/single: it monitors the
@@ -1696,12 +1861,17 @@ build_summary() {   # SUMMARY_LINES - shown as text and in the dialog (password 
   [[ $RESET == true ]] && SUMMARY_LINES+=("  RESET         : database ${DB_NAME} will be DROPPED and recreated")
   SUMMARY_LINES+=("  Agent 2 on this server: ${INSTALL_AGENT}")
   if [[ $INSTALL_AGENT == yes ]]; then SUMMARY_LINES+=("  Agent host name: ${AGENT_HOSTNAME}"); fi
+  if [[ $ENABLE_UFW == yes ]]; then
+    SUMMARY_LINES+=("  Firewall (ufw): enable it - SSH ${SSH_PORTS[*]:-<not detected: will NOT be enabled>} first, then the ports of this role")
+  else
+    SUMMARY_LINES+=("  Firewall (ufw): not enabled by choice (rules only if ufw is already active)")
+  fi
   if [[ $MODE != db ]]; then
     SUMMARY_LINES+=("  Windows host  : ${WIN_HOSTNAME:-<WIN_HOSTNAME>} / ${WIN_IP:-<WIN_IP>}")
   fi
   [[ -n $ENV_FILE ]] && SUMMARY_LINES+=("  Env file      : ${ENV_FILE}")
   SUMMARY_LINES+=("  Output files  : ${OUT_DIR}")
-  if [[ $UI != classic ]]; then SUMMARY_LINES+=("  Display       : $(ui_mode_text)" "  Full output   : ${LOG_FILE}"); fi
+  if [[ $DRY_RUN != true ]]; then SUMMARY_LINES+=("  Verbose output: ${VERBOSE:-no}" "  Full output   : ${LOG_FILE}"); fi
   return 0
 }
 show_summary() {
@@ -1713,13 +1883,22 @@ show_summary() {
 # confirm_summary: the last question before anything is changed. In dialog
 # mode this is the summary screen (password masked); 1 = do not proceed.
 confirm_summary() {
-  local text l
+  local text l n=0 h rows=24 s
   if [[ $USE_DIALOG == true ]]; then
-    text="Nothing has been changed yet."$'\n\n'
-    for l in "${SUMMARY_LINES[@]}"; do text+="${l}"$'\n'; done
-    text+=$'\n'"Proceed with these settings?"
+    # The question goes FIRST: if the list is taller than the terminal, only
+    # its last lines are cut, never the question. "Full output" stays in the
+    # text summary only. Height: the text + 7 (frame, buttons), at most the
+    # terminal height.
+    text="Proceed with these settings?"$'\n'
+    for l in "${SUMMARY_LINES[@]}"; do
+      [[ $l == "  Full output"* ]] && continue
+      text+=$'\n'"${l}"; n=$((n + 1))
+    done
+    s=$(stty size </dev/tty 2>/dev/null || true)
+    if [[ $s =~ ^([0-9]+)\ [0-9]+$ ]] && ((BASH_REMATCH[1] >= 16)); then rows=${BASH_REMATCH[1]}; fi
+    h=$((n + 9)); ((h > rows)) && h=$rows; ((h < 16)) && h=16
     # no --scrolltext: it moves the focus to the text, and Enter stops working
-    _dlg --title "Summary" --yesno "$text" 24 78 || return 1
+    _dlg --title "Summary - nothing has been changed yet" --yesno "$text" "$h" 78 || return 1
     _record "  Proceed with these settings? -> yes (summary dialog)"
     return 0
   fi
@@ -1838,7 +2017,8 @@ preflight() {
   if [[ $RESET == true && $MODE == app ]]; then
     vrow FAIL "--reset on the right node" "app mode cannot drop the remote DB" "run --reset on the DB server: sudo ${LAUNCH} --mode db --reset"
   fi
-  vrow PASS "ufw" "$(ufw_state) (it is never enabled by this script)"
+  if [[ $ENABLE_UFW == yes ]]; then vrow PASS "ufw" "$(ufw_state) now - enabled in step $([[ $MODE == db ]] && echo 1.3 || echo 2.7a)"
+  else vrow PASS "ufw" "$(ufw_state) (not enabled by choice: --no-ufw / ZBX_ENABLE_UFW=no)"; fi
 
   print_rows
   local h
@@ -2095,10 +2275,14 @@ part1_database() {
   fi
 
   # ---- 1.3 Firewall ----------------------------------------------------------
-  step 1.3 "Open the firewall for MySQL"
-  if [[ $MODE == db ]]; then
+  if [[ $MODE == db && $ENABLE_UFW == yes ]]; then
+    step 1.3 "Firewall (ufw): allow the needed ports and enable it"
+    setup_ufw open_db_firewall
+  elif [[ $MODE == db ]]; then
+    step 1.3 "Open the firewall for MySQL"
     open_db_firewall
   else
+    step 1.3 "Open the firewall for MySQL"
     skip "single VM: MySQL is only used locally - nothing to open"
     step_skip "single VM: MySQL is only used locally"
   fi
@@ -2242,6 +2426,85 @@ open_db_firewall() {
   say "      firewall changed: ${FW_CHANGED[*]}"
 }
 
+# ---- ufw step: db 1.3, app/single 2.7a (ENABLE_UFW=yes) --------------------
+# Install ufw, drop 'zabbix-setup' rules that no longer match (DB port or an
+# IP changed), add the SSH rule(s) FIRST, then the role's rules, then the
+# default policies and enable. Never "ufw reset": other rules are kept. A
+# re-run adds nothing twice (ufw show added is compared first). A rule that
+# already exists WITHOUT the comment counts as present and is never touched:
+# only rules carrying the comment are added or deleted. Without an SSH port
+# ufw is not enabled: LEGACY_FN (the old "only if active") runs.
+_in_list() { local x n=$1; shift; for x in "$@"; do [[ $x == "$n" ]] && return 0; done; return 1; }
+setup_ufw() {   # setup_ufw LEGACY_FN
+  local legacy=$1 st r l note n_add=0 n_del=0 n_unm=0
+  local -a words=() have=()
+  detect_ssh_ports
+  ufw_plan
+  if ((${#SSH_PORTS[@]} == 0)); then
+    warn "No SSH port detected (sshd -T, ss -ltnp, /etc/ssh/sshd_config) - ufw is NOT enabled, so this server cannot lock you out. To enable it, re-run with --ssh-port N (the SSH port you connect with)."
+    "$legacy"
+    step_skip "ufw not enabled: no SSH port detected"
+    return 0
+  fi
+  warn "A firewall change over SSH can cut the connection. The SSH rule (port ${SSH_PORTS[*]}; source: ${SSH_PORT_SRC}) is added first, before ufw is enabled."
+  apt_install "sudo apt install ufw -y" ufw
+  if [[ $DRY_RUN == true ]]; then
+    _action "\$ sudo ufw show added   # rules '${UFW_COMMENT}' that no longer match (DB port / IP changed) are deleted first"
+    for r in "${UFW_RULES[@]}"; do _action "\$ $(_ufw_shown "$r")"; done
+    _action "\$ sudo ufw default deny incoming   # only if ufw is not active yet"
+    _action "\$ sudo ufw default allow outgoing"
+    _action "\$ sudo ufw --force enable"
+    _action "\$ sudo ufw status numbered"
+    return 0
+  fi
+  st=$(ufw_state)
+  _action "\$ sudo ufw status   # -> ${st}"
+  mapfile -t have < <(ufw_added_rules)
+  for l in "${have[@]}"; do
+    [[ $l == *" comment ${UFW_COMMENT}" ]] || continue
+    _in_list "$l" "${UFW_RULES[@]}" && continue
+    r=${l% comment "$UFW_COMMENT"}
+    # only the kinds of rule this step creates - never an SSH rule; the agent
+    # rule stays when the agent is not requested (a "no" never removes it)
+    case $r in
+      "allow from "*" to any port ${ZBX_AGENT_PORT} proto tcp") [[ $INSTALL_AGENT == yes ]] || continue ;;
+      "allow from "*" to any port "*" proto tcp"|"allow ${HTTP_PORT}/tcp"|"allow ${ZBX_TRAPPER_PORT}/tcp") ;;
+      *) continue ;;
+    esac
+    read -r -a words <<<"$r"
+    run_show "sudo ufw delete ${r}   # old '${UFW_COMMENT}' rule" ufw delete "${words[@]}"
+    n_del=$((n_del + 1))
+  done
+  for r in "${UFW_RULES[@]}"; do
+    if _in_list "$r" "${have[@]}"; then _action "\$ $(_ufw_shown "$r")"; skip "rule already there"; continue; fi
+    # the same rule without the comment (added by hand or by an older run):
+    # it already does the job - left untouched, never adopted or deleted
+    if _in_list "${r% comment "$UFW_COMMENT"}" "${have[@]}"; then
+      _action "\$ $(_ufw_shown "$r")"
+      skip "already present (not managed by the script): ufw ${r% comment "$UFW_COMMENT"}"
+      n_unm=$((n_unm + 1)); continue
+    fi
+    read -r -a words <<<"$r"
+    run_show "$(_ufw_shown "$r")" ufw "${words[@]}"
+    n_add=$((n_add + 1))
+  done
+  if [[ $st == active ]]; then
+    note="already active, ${n_add} rule(s) added"
+  else
+    run ufw default deny incoming
+    run ufw default allow outgoing
+    run ufw --force enable
+    note="enabled, ${n_add} rule(s) added"
+  fi
+  ((n_del > 0)) && note+=", ${n_del} old rule(s) removed"
+  ((n_unm > 0)) && note+=", ${n_unm} already present (not managed by the script)"
+  _xcmd "ufw status numbered"
+  ufw status numbered 2>&1 | _logpipe
+  FW_CHANGED+=("ufw ${note}")
+  say "      ufw: ${note}"
+  step_info "ufw ${note}"
+}
+
 # The app server's IP changed since the last run: move the account over.
 rename_moved_user() {
   [[ $DRY_RUN == true || -z $ST_APP_IP || $ST_APP_IP == "$APP_IP" ]] && return 0
@@ -2325,6 +2588,11 @@ db_install_agent() {
 # only when ufw is already active (never enabled here).
 open_agent_firewall() {
   local st
+  # with ENABLE_UFW=yes the rule was added by the ufw step (1.3)
+  if [[ $ENABLE_UFW == yes && ${#SSH_PORTS[@]} -gt 0 ]]; then
+    _action "\$ sudo ufw allow from ${APP_IP} to any port ${ZBX_AGENT_PORT} proto tcp comment '${UFW_COMMENT}'   # done in step 1.3"
+    return 0
+  fi
   if [[ $DRY_RUN == true ]]; then
     _action "\$ sudo ufw allow from ${APP_IP} to any port ${ZBX_AGENT_PORT} proto tcp   # only if ufw is active"
     return 0
@@ -2459,8 +2727,13 @@ part2_app() {
   fi
 
   # ---- 2.7a Firewall -------------------------------------------------------------
-  step 2.7a "Open the firewall for the web UI (${HTTP_PORT}) and active agent checks (${ZBX_TRAPPER_PORT})"
-  open_app_firewall
+  if [[ $ENABLE_UFW == yes ]]; then
+    step 2.7a "Firewall (ufw): allow the needed ports and enable it"
+    setup_ufw open_app_firewall
+  else
+    step 2.7a "Open the firewall for the web UI (${HTTP_PORT}) and active agent checks (${ZBX_TRAPPER_PORT})"
+    open_app_firewall
+  fi
 
   # ---- 2.8 / 2.9 Manual ----------------------------------------------------------
   step 2.8 "Complete the frontend web wizard - manual, values in NEXT STEPS"
@@ -2695,6 +2968,8 @@ open_app_firewall() {
 render_handoff() {   # render_handoff PASSWORD_OR_MASK
   local pwline="ZBX_DB_PASSWORD='$1'"
   [[ -z $1 ]] && pwline="# ZBX_DB_PASSWORD unchanged (kept on a re-run) - use the value from the first run"
+  # shown on screen masked: the real value is in the file and the REMEMBER block
+  [[ $1 == "$MASK" ]] && pwline+=$'\n'"#   (masked here - the real password is in ${HANDOFF_FILE##*/} and in the REMEMBER block at the end)"
   cat <<EOF
 # ###########################################################################
 #  zabbix-setup hand-off - values for the APP server  ($(date '+%F %T'))
@@ -2762,6 +3037,9 @@ render_env() {   # render_env PASSWORD_OR_MASK
   _env_kv DB_USER "$DB_USER"
   _env_kv TIMEZONE "$TIMEZONE"
   _env_kv INSTALL_AGENT "$INSTALL_AGENT"
+  _env_kv ENABLE_UFW "$ENABLE_UFW"
+  _env_kv SSH_PORT "$SSH_PORT"
+  _env_kv VERBOSE "$VERBOSE"
   [[ $INSTALL_AGENT == yes ]] && _env_kv AGENT_HOSTNAME "$AGENT_HOSTNAME"
   _env_kv WIN_HOSTNAME "$WIN_HOSTNAME"
   _env_kv WIN_IP "$WIN_IP"
@@ -2812,17 +3090,11 @@ git_warning() {   # git_warning FILE...
   return 0
 }
 
-render_next_steps() {   # render_next_steps PASSWORD_OR_MASK
-  local pw=$1 host port port_note wh=${WIN_HOSTNAME:-<WIN_HOSTNAME>} wi=${WIN_IP:-<WIN_IP>}
-  if [[ $MODE == app ]]; then
-    host=$DB_IP; port=$DB_PORT
-    port_note="type it explicitly - 0 means 3306 and the test would fail"
-  elif [[ $SINGLE_CUSTOM_PORT == true ]]; then
-    host=127.0.0.1; port=$DB_PORT; port_note="custom port: TCP to 127.0.0.1, not localhost (= socket)"
-  else
-    host=localhost; port=0; port_note="0 = default (local socket)"
-  fi
-  [[ -z $pw ]] && pw="<unchanged - the password from the first run>"
+# (the password is no longer part of this block: it is printed once, in the
+# REMEMBER block - render_wizard - which follows it in zabbix-next-steps.txt)
+render_next_steps() {   # render_next_steps [PASSWORD_OR_MASK - not used]
+  local host port wh=${WIN_HOSTNAME:-<WIN_HOSTNAME>} wi=${WIN_IP:-<WIN_IP>}
+  wizard_db_target; host=$WZ_HOST; port=$WZ_PORT
   cat <<EOF
 ###########################################################################
 #  NEXT STEPS (manual)  - ${MODE} setup on ${APP_IP}, $(date '+%F %T')
@@ -2840,15 +3112,8 @@ EOF
 
 1. Web setup wizard  (guide Part 2, steps 8-9)
    Open      http://${APP_IP}/zabbix
-   Database type   MySQL
-   Database host   ${host}
-   Database port   ${port}      (${port_note})
-   Database name   ${DB_NAME}
-   User            ${DB_USER}
-   Password        ${pw}
-   Time zone       ${TIMEZONE}
-   Then log in as  Admin / zabbix   and change it IMMEDIATELY:
-                   Users > Users > Admin > Change password
+   Database values (host ${host}, port ${port}), the password and the
+   Admin login: see "REMEMBER: ZABBIX WEB WIZARD" at the end.
 EOF
   if [[ $INSTALL_AGENT == no ]]; then
     cat <<EOF
@@ -2892,20 +3157,111 @@ EOF
 
 # Show a block with the real password on the terminal only, save it (600),
 # and record only the masked version in the log.
+# What the Zabbix web wizard needs as "Database host" / "Database port" in
+# this scenario -> WZ_HOST WZ_PORT WZ_PORT_NOTE
+wizard_db_target() {
+  case $MODE in
+    db|app) WZ_HOST=$DB_IP; WZ_PORT=$DB_PORT; WZ_PORT_NOTE="type it explicitly - 0 means 3306 and the test would fail" ;;
+    *)
+      if [[ $SINGLE_CUSTOM_PORT == true ]]; then
+        WZ_HOST=127.0.0.1; WZ_PORT=$DB_PORT; WZ_PORT_NOTE="custom port: TCP to 127.0.0.1, not localhost (= socket)"
+      else
+        WZ_HOST=localhost; WZ_PORT=0; WZ_PORT_NOTE="0 = default (local socket)"
+      fi ;;
+  esac
+}
+
+# render_wizard PASSWORD_OR_MASK - the last block of every real run, and the
+# end of zabbix-next-steps.txt / zabbix-handoff.txt: the values the web
+# wizard asks for. The DB password appears here and nowhere else on screen.
+render_wizard() {
+  local pw=$1 head name name_line bar="+=========================================================================+"
+  [[ -z $pw ]] && pw="<unchanged - the password from the first run>"
+  wizard_db_target
+  head="DATABASE HOST = THE HOSTNAME/IP OF THE DATABASE SERVER. NOT LOCALHOST, NOT THE ZABBIX SERVER."
+  case $MODE in
+    db)
+      name=$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)
+      name_line="(this database server's name is ${name:-?} - the name only works if the web server can resolve it (DNS or /etc/hosts), otherwise use the IP)" ;;
+    app)
+      # type the IP; the name is only a second line, and only when the
+      # reverse lookup resolves forward to the same IP again
+      name=$(getent hosts "$DB_IP" 2>/dev/null | awk '{print $2; exit}' || true)
+      # (the FIRST address the name resolves to - the one a client would use)
+      if [[ -n $name && $(getent ahostsv4 "$name" 2>/dev/null | awk '{print $1; exit}' || true) == "$DB_IP" ]]; then
+        name_line="name (works only if this web server can resolve it): ${name}"
+      else
+        name_line=""
+      fi ;;
+    *)
+      head="DATABASE HOST: ON A SINGLE VM THE DATABASE IS ON THIS SERVER - TYPE ${WZ_HOST^^} EXACTLY, NOT THE HOST NAME OR THE IP."
+      name=$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)
+      name_line="(this server is ${name:-?}, but do not type that name here: ${WZ_HOST} is what MySQL accepts in this setup)" ;;
+  esac
+  cat <<EOF
+${bar}
+|  REMEMBER: ZABBIX WEB WIZARD    http://${APP_IP}/zabbix
+${bar}
+|  ${head}
+|
+|  Database type   MySQL
+|  Database host   ${WZ_HOST}
+EOF
+  if [[ -n $name_line ]]; then printf '|                  %s\n' "$name_line"; fi
+  cat <<EOF
+|  Database port   ${WZ_PORT}      (${WZ_PORT_NOTE})
+|  Database name   ${DB_NAME}
+|  User            ${DB_USER}
+|  Password        ${pw}
+|  Time zone       ${TIMEZONE}
+|
+|  After the wizard, log in to the Zabbix website with Admin / zabbix, and
+|  change that password immediately (Users > Admin).
+|  Admin / zabbix is the Zabbix web login - a DIFFERENT account from the
+|  database user '${DB_USER}' above.
+EOF
+  if [[ $MODE == db ]]; then
+    printf '|\n|  Next: run the script on the APP server, then open http://%s/zabbix\n' "$APP_IP"
+  fi
+  printf '%s\n' "$bar"
+}
+
+# emit_secret_block RENDER_FN FILE - the hand-off (db) or NEXT STEPS block on
+# the terminal and in the log WITHOUT the password; the 600 file gets the
+# real one plus the REMEMBER block (commented out in the hand-off, so it is
+# still a valid env file). The password itself is printed once, at the very
+# end, by emit_wizard.
 emit_secret_block() {   # emit_secret_block RENDER_FN FILE
-  local fn=$1 file=$2 pw=$DB_PASSWORD line
+  local fn=$1 file=$2 pw=$DB_PASSWORD line pre=""
   if [[ $DRY_RUN == true ]]; then
     while IFS= read -r line; do say "$line"; done < <("$fn" "$MASK")
     return 0
   fi
-  printf '\n'
-  # the real password goes to the terminal (and the 600 file) only, never via say()
-  "$fn" "$pw"
-  "$fn" "$pw" | write_private "$file"
-  if [[ $LOG_ON == true ]]; then
-    while IFS= read -r line; do _record "$line"; done < <("$fn" "$MASK")
+  [[ $fn == render_handoff ]] && pre="# "
+  say ""
+  while IFS= read -r line; do say "$line"; done < <("$fn" "$MASK")
+  {
+    "$fn" "$pw"
+    printf '%s\n' "${pre% }"
+    while IFS= read -r line; do printf '%s%s\n' "$pre" "$line"; done < <(render_wizard "$pw")
+  } | write_private "$file"
+  say ""
+  say "Saved to ${file} (chmod 600) - with the password and the wizard values; the password is printed once, at the very end."
+}
+# emit_wizard FILE - the very last thing a real run prints: the REMEMBER block
+# with the real password (terminal only); the log gets the masked version.
+emit_wizard() {
+  local line
+  if [[ $DRY_RUN == true ]]; then
+    while IFS= read -r line; do say "$line"; done < <(render_wizard "$MASK")
+    return 0
   fi
-  printf '\n%s\n' "Saved to ${file} (chmod 600). The password above is shown once and is not in ${LOG_FILE}."
+  printf '\n'
+  render_wizard "$DB_PASSWORD"
+  if [[ $LOG_ON == true ]]; then
+    while IFS= read -r line; do _record "$line"; done < <(render_wizard "$MASK")
+  fi
+  printf '%s\n' "The password above is shown only here and in ${1} (chmod 600) - never in ${LOG_FILE}."
 }
 
 # =============================================================================
@@ -2924,23 +3280,62 @@ vc_chrony() {
   elif chrony_synced; then vrow PASS "chrony time sync" "synchronised"
   else vrow WARN "chrony time sync" "running, not synchronised yet" "chronyc sources -v (UDP 123 outbound must be allowed)"; fi
 }
-vc_ufw() {      # vc_ufw PORT [FROM_IP]
-  local port=$1 from=${2:-} st out line found="" broad="" re
+# vc_ufw PORT [FROM_IP] [LABEL] - is there an ALLOW rule for PORT (from FROM_IP)?
+# ENABLE_UFW=yes: ufw must be on, so a missing rule is a FAIL even while
+# ufw is off (the rules ufw holds are checked then); no: as before (nothing
+# to check while ufw is off).
+vc_ufw() {
+  local port=$1 from=${2:-} label=${3:+ (${3})} st out line found="" broad="" re c="" name
   st=$(ufw_state)
-  if [[ $st != active ]]; then vrow PASS "ufw allows ${port}/tcp" "ufw ${st} - nothing to check"; return 0; fi
+  [[ $UFW_EXPECTED == yes ]] && c=" comment '${UFW_COMMENT}'"
+  name="ufw allows ${port}/tcp${from:+ from ${from}}${label}"
+  local fix="sudo ufw allow ${port}/tcp${c}"
+  [[ -n $from ]] && fix="sudo ufw allow from ${from} to any port ${port} proto tcp${c}"
+  if [[ $st != active ]]; then
+    if [[ $UFW_EXPECTED != yes ]]; then vrow PASS "$name" "ufw ${st} - nothing to check"; return 0; fi
+    while IFS= read -r line; do
+      if [[ $line == "allow ${port}/tcp"* || ( $line == *" port ${port} proto tcp"* && ( -z $from || $line == *"from ${from} "* ) ) ]]; then found=$line; fi
+    done < <(ufw_added_rules)
+    if [[ -n $found ]]; then vrow PASS "$name" "rule added (applies once ufw is on)"
+    else vrow FAIL "$name" "no rule" "$fix"; fi
+    return 0
+  fi
   out=$(ufw status 2>/dev/null || true)
   re="^${port}(/tcp)?[[:space:]]+ALLOW"
   while IFS= read -r line; do
     [[ $line =~ $re ]] || continue
-    if [[ -n $from && $line == *"$from"* ]]; then found=$line; fi
+    if [[ -z $from || $line == *"$from"* ]]; then found=$line; fi
     if [[ $line == *Anywhere* ]]; then broad=$line; fi
   done <<<"$out"
-  local fix="sudo ufw allow ${port}/tcp"
-  [[ -n $from ]] && fix="sudo ufw allow from ${from} to any port ${port} proto tcp"
-  if [[ -n $found ]]; then vrow PASS "ufw allows ${port}/tcp${from:+ from ${from}}" "rule present"
-  elif [[ -n $broad && -n $from ]]; then vrow WARN "ufw allows ${port}/tcp from ${from}" "open to Anywhere" "scope it: ${fix}"
-  elif [[ -n $broad ]]; then vrow PASS "ufw allows ${port}/tcp" "rule present"
-  else vrow FAIL "ufw allows ${port}/tcp${from:+ from ${from}}" "no rule" "$fix"; fi
+  if [[ -n $from && -z $found && -n $broad ]]; then vrow WARN "$name" "open to Anywhere" "scope it: ${fix}"
+  elif [[ -n $found ]]; then vrow PASS "$name" "rule present"
+  else vrow FAIL "$name" "no rule" "$fix"; fi
+}
+# ufw on, and the SSH rule - when the script enables ufw (ENABLE_UFW=yes)
+UFW_EXPECTED=no   # vc_ufw: must ufw be on? (set by vc_ufw_base)
+vc_ufw_base() {
+  local st p
+  UFW_EXPECTED=$ENABLE_UFW
+  if [[ $ENABLE_UFW != yes ]]; then
+    vrow SKIP "ufw enabled by the script" "skipped by choice (--no-ufw / ZBX_ENABLE_UFW=no)"
+    return 0
+  fi
+  st=$(ufw_state)
+  detect_ssh_ports
+  if [[ $st != active ]] && ((${#SSH_PORTS[@]} == 0)); then
+    # the ufw step refused to enable it (no SSH port): not a failure
+    UFW_EXPECTED=no
+    vrow WARN "ufw active" "${st} - not enabled: no SSH port detected" "to enable it: re-run with --ssh-port N (the SSH port you connect with)"
+    return 0
+  fi
+  if [[ $st == active ]]; then vrow PASS "ufw active" "default: $(ufw status verbose 2>/dev/null | sed -n 's/^Default: //p')"
+  else vrow FAIL "ufw active" "$st" "re-run the script (it adds the SSH rule first), or: sudo ufw --force enable once the SSH rule is there"; fi
+  [[ $st == absent ]] && return 0
+  if ((${#SSH_PORTS[@]} == 0)); then
+    vrow WARN "ufw allows SSH" "no SSH port detected" "sudo ufw allow <your SSH port>/tcp comment '${UFW_COMMENT}'"
+    return 0
+  fi
+  for p in "${SSH_PORTS[@]}"; do vc_ufw "$p" "" "SSH"; done
 }
 
 # MySQL-side checks shared by db and single
@@ -2976,6 +3371,7 @@ verify_db() {
   bind=$(mysql_root -e "SELECT @@GLOBAL.bind_address" 2>/dev/null || echo "?")
   if [[ $bind == 0.0.0.0 || $bind == "*" ]]; then vrow PASS "bind-address is 0.0.0.0" "$bind"
   else vrow FAIL "bind-address is 0.0.0.0" "is ${bind}" "bind-address = 0.0.0.0 under [mysqld] in ${MYSQLD_CNF}; sudo systemctl restart mysql"; fi
+  vc_ufw_base
   vc_ufw "$DB_PORT" "$APP_IP"
   remote=$(mysql_root -e "SELECT CONCAT(user,'@',host) FROM mysql.user WHERE host NOT IN ('localhost','127.0.0.1','::1') ORDER BY 1" 2>/dev/null || echo "?")
   local a
@@ -3054,6 +3450,7 @@ verify_app() {
   code=$(http_code "http://localhost/zabbix")
   if [[ $code == 200 || $code == 206 ]]; then vrow PASS "frontend http://localhost/zabbix" "HTTP ${code}"
   else vrow FAIL "frontend http://localhost/zabbix" "HTTP ${code}" "sudo apache2ctl configtest; sudo systemctl restart apache2 ${PHP_FPM}; tail /var/log/apache2/error.log"; fi
+  vc_ufw_base
   vc_ufw "$HTTP_PORT"
   vc_ufw "$ZBX_TRAPPER_PORT"
 }
@@ -3149,6 +3546,10 @@ resolve_verify_settings() {
   if [[ $MODE == db ]]; then INSTALL_AGENT=${INSTALL_AGENT:-${ST_INSTALL_AGENT:-no}}
   else INSTALL_AGENT=${INSTALL_AGENT:-${ST_INSTALL_AGENT:-yes}}; fi
   INSTALL_AGENT=${INSTALL_AGENT,,}
+  # ufw choice: flag/env/env file, else the state file; older state = no
+  if [[ -n $ENABLE_UFW ]] && ! v_yesno "$ENABLE_UFW"; then die "ENABLE_UFW='${ENABLE_UFW}' from ${SRC[ENABLE_UFW]:-?}: ${VERR}"; fi
+  ENABLE_UFW=${ENABLE_UFW:-${ST_ENABLE_UFW:-no}}; ENABLE_UFW=${ENABLE_UFW,,}
+  [[ -n $SSH_PORT ]] || SSH_PORT=$ST_SSH_PORT   # --ssh-port of the last run (no SSH detected)
   if [[ -n $AGENT_HOSTNAME ]] && ! v_agent_host "$AGENT_HOSTNAME"; then die "AGENT_HOSTNAME='${AGENT_HOSTNAME}': ${VERR}"; fi
   [[ -n $AGENT_HOSTNAME ]] || AGENT_HOSTNAME=${ST_AGENT_HOSTNAME:-$(kv_get "$ZBX_AGENT_CONF" "" Hostname || true)}
   detect_php_fpm >/dev/null
@@ -3192,10 +3593,10 @@ main() {
 
   # whiptail dialogs on a terminal; plain text prompts otherwise
   if [[ $NO_DIALOG != true && $ASSUME_YES != true ]] && dialog_possible; then USE_DIALOG=true; fi
-  ui_init                                     # one line per step / --verbose / plain
 
   # --add-user on its own ---------------------------------------------------------
   if [[ -n $ADD_USER && -z $MODE ]]; then
+    ui_init                                   # (no verbose question here: --verbose or ZBX_VERBOSE)
     part "Part 0 - Preparation"
     STEP_TOTAL=1
     add_admin_user
@@ -3210,6 +3611,7 @@ main() {
     say "Saved to: ${MANUAL_FILE} (password masked)."
   fi
   collect_inputs
+  ui_init                                     # one line per step / verbose / plain
   build_summary
   if [[ $DRY_RUN != true && $ASSUME_YES != true ]]; then
     if [[ $USE_DIALOG == true ]]; then
@@ -3248,6 +3650,8 @@ main() {
     while IFS= read -r line; do say "    ${line}"; done < <(render_env "$MASK")
     git_warning "$DEFAULT_ENV_FILE"
     say ""
+    if [[ $MODE == db ]]; then emit_wizard "$HANDOFF_FILE"; else emit_wizard "$NEXT_STEPS_FILE"; fi
+    say ""
     say "DRY RUN complete - nothing was changed. Steps saved to ${MANUAL_FILE}"
     exit 0
   fi
@@ -3270,8 +3674,10 @@ main() {
   fi
   if ((vrc != 0)); then
     err "Setup finished but verification reported FAIL - see the fixes in the table above."
-    exit 1
   fi
+  # the very last block: what the web wizard needs (the password, once)
+  if [[ $MODE == db ]]; then emit_wizard "$HANDOFF_FILE"; else emit_wizard "$NEXT_STEPS_FILE"; fi
+  if ((vrc != 0)); then exit 1; fi
 }
 
 # Run main when executed as a file, as the one-liner  bash <(curl -fsSL URL)

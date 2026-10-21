@@ -1,6 +1,6 @@
 # zabbix-setup.sh: how to use it
 
-Step-by-step usage of [`zabbix-setup.sh`](zabbix-setup.sh) version 1.3.0: Zabbix 8.0 LTS server side on Ubuntu 26.04. The manual procedure it automates is in [`zabbix-3tier-setup-guide.md`](zabbix-3tier-setup-guide.md).
+Step-by-step usage of [`zabbix-setup.sh`](zabbix-setup.sh) version 1.4.0: Zabbix 8.0 LTS server side on Ubuntu 26.04. The manual procedure it automates is in [`zabbix-3tier-setup-guide.md`](zabbix-3tier-setup-guide.md).
 
 ## Contents
 
@@ -52,7 +52,7 @@ chmod +x zabbix-setup.sh
 sudo ./zabbix-setup.sh --mode single
 ```
 
-Do not use the older `sudo bash -c "$(curl -fsSL URL)"` form: since version 1.2.0 the script is over 128 KiB, the most Linux accepts as a single argument, so it fails with "Argument list too long". Read the script before you run it as root. To pin a version, replace `main` in the URL with a tag or a commit hash, for example `.../Moonbara/scripts/zabbix-v1.1.1/zabbix/zabbix-setup.sh`. The rest of this page uses `sudo ./zabbix-setup.sh`.
+Do not use the older `sudo bash -c "$(curl -fsSL URL)"` form: since version 1.2.0 the script is over 128 KiB, the most Linux accepts as a single argument, so it fails with "Argument list too long". Do not shorten the one-liner to `sudo bash <(curl -fsSL URL)` either: sudo closes the pipe that `<( )` creates, and bash stops with `/dev/fd/63: No such file or directory`. If you prefer the short form, open a root shell first with `sudo -i`, then run `bash <(curl -fsSL URL) --mode single`; or download and run as shown above. Read the script before you run it as root. To pin a version, replace `main` in the URL with a tag or a commit hash, for example `.../Moonbara/scripts/zabbix-v1.1.1/zabbix/zabbix-setup.sh`. The rest of this page uses `sudo ./zabbix-setup.sh`.
 
 **Run it from the directory where you want the output files.** The hand-off, env file and next-steps file are written to the current directory.
 
@@ -80,7 +80,7 @@ Add `--no-dialog` for plain text prompts.
 - **A failed step** stays a red `[✗]`, followed by its last 15 lines of output, the error and its fix (the guide's troubleshooting hint), and the log path. Fix the cause and run the script again.
 - **A question inside a step** (a static IP to apply, `--add-user`, `passwd`, `netplan try`): the spinner stops, the step's output so far is printed for context, then the question. The step line comes back after your answer.
 - **At the end:** the list of all steps with the total time, then the verification table and the NEXT STEPS block.
-- **`--verbose` / `-v`** (or `ZBX_VERBOSE=1`, e.g. `sudo --preserve-env=ZBX_VERBOSE ...`): no spinner. Each step's title, then every command as `$ ...` with its live output indented underneath, then the `[✓]` line. The password and the MySQL option file are never shown.
+- **Verbose output** is the first question: **Show detailed output (verbose)?** (default no). `--verbose` / `-v`, or `ZBX_VERBOSE=yes|no` in the environment or an env file, answers it in advance. With yes: no spinner. Each step's title, then every command as `$ ...` with its live output indented underneath, then the `[✓]` line. The password and the MySQL option file are never shown.
 - **Not a terminal** (piped to a file, cron, CI): plain `[..] step` / `[OK] step (14s)` / `[SKIP]` / `[FAIL]` lines, no escape codes. `NO_COLOR=1` or `TERM=dumb`: no colours and no redraw. A non-UTF-8 locale: `[ ]` running, `[v]` done, `[x]` failed.
 - **`--dry-run` and `--verify`** print exactly as before.
 
@@ -106,21 +106,23 @@ sudo ./zabbix-setup.sh --mode single
 
 The script asks, in this order:
 
-1. **Does this server already have a static IP?** The default is "yes" when the address is not a DHCP lease. See [Static IP](#7-static-ip).
-2. **This server's IP (APP_IP)**: pre-filled with the detected address.
-3. **Use the default MySQL setup (local socket, port 0 in the wizard)?** Answer **yes** unless you were told to use a port. If you answer no, the next question is **Custom MySQL port**, and Zabbix will then connect over TCP to `127.0.0.1:<port>`.
-4. **Database name** and **Database user**: both default to `zabbix`.
-5. **DB password (press Enter to generate one)**: typed twice, or Enter for a random 20-character password.
-6. **Timezone**: default `America/Toronto`.
-7. **Install Zabbix Agent 2 on this server (it monitors this server itself, not the Windows PC)?** Default yes. See [Agent 2 on the server](#agent-2-on-the-server).
-8. **Windows host name / Windows IP**: optional, only used to fill in the printed Windows steps.
-9. **Summary**: check it, then confirm. Nothing changes before this point.
+1. **Show detailed output (verbose)?** Default no: one line per step. See [Output](#1-before-you-start).
+2. **Does this server already have a static IP?** The default is "yes" when the address is not a DHCP lease. See [Static IP](#7-static-ip).
+3. **This server's IP (APP_IP)**: pre-filled with the detected address.
+4. **Use the default MySQL setup (local socket, port 0 in the wizard)?** Answer **yes** unless you were told to use a port. If you answer no, the next question is **Custom MySQL port**, and Zabbix will then connect over TCP to `127.0.0.1:<port>`.
+5. **Database name** and **Database user**: both default to `zabbix`.
+6. **DB password (press Enter to generate one)**: typed twice, or Enter for a random 20-character password.
+7. **Timezone**: default `America/Toronto`.
+8. **Install Zabbix Agent 2 on this server (it monitors this server itself, not the Windows PC)?** Default yes. See [Agent 2 on the server](#agent-2-on-the-server).
+9. **Windows host name / Windows IP**: optional. They fill in the printed Windows steps, and the IP also limits the ufw rule for port 10051.
+10. **Enable the ufw firewall with these rules?** The exact rules are listed first. Default yes. See [Firewall](#firewall-ufw).
+11. **Summary**: check it, then confirm. Nothing changes before this point.
 
 What you should see next:
 
 - One line per step, in the guide's order: `0.1` (preflight: OS, disk, RAM, the repository, ports), `0.3`, `0.4`, `1.1` … `2.9`. See [Output](#1-before-you-start).
 - The list of steps with the total time, then a verification table.
-- A **NEXT STEPS** block with the web wizard values and the password. The password is shown once and saved to `zabbix-next-steps.txt`.
+- A **NEXT STEPS** block (the Windows steps), then, last of all, the boxed **REMEMBER: ZABBIX WEB WIZARD** block with the wizard values and the password. The password is shown only there, once, and both blocks are saved to `zabbix-next-steps.txt`.
 
 Check it worked, now or any time later:
 
@@ -152,15 +154,15 @@ Follow this exact order:
 sudo ./zabbix-setup.sh --mode db --app-ip <APP_IP>
 ```
 
-It asks for the static IP, the **Database port?** (default `8090`), the database name and user, the password and the timezone. Then comes **Install Zabbix Agent 2 on this database server so the Zabbix server can monitor it?** (default yes), and with yes, the **Agent host name** (default: the short hostname). Then it:
+It asks the verbose question, the static IP, the **Database port?** (default `8090`), the database name and user, the password and the timezone. Then comes **Install Zabbix Agent 2 on this database server so the Zabbix server can monitor it?** (default yes), and with yes, the **Agent host name** (default: the short hostname), and finally whether to enable ufw. Then it:
 
 - installs MySQL
 - sets `bind-address = 0.0.0.0` and `port = <DB_PORT>`
-- opens the port in `ufw`, but only if `ufw` is already active and only from `<APP_IP>`
+- in step 1.3 enables `ufw`: SSH first, then `<DB_PORT>` (and `10050` with the agent), only from `<APP_IP>` (see [Firewall](#firewall-ufw))
 - creates the database and the user `'zabbix'@'<APP_IP>'`
-- with the agent (step 1.6): adds the Zabbix repository, installs **only** `zabbix-agent2`, and sets `Server=<APP_IP>`, `ServerActive=<APP_IP>` and `Hostname=<AGENT_HOSTNAME>` in `/etc/zabbix/zabbix_agent2.conf`. It then starts the agent, and if `ufw` is active, opens port `10050` for `<APP_IP>` only.
+- with the agent (step 1.6): adds the Zabbix repository, installs **only** `zabbix-agent2`, and sets `Server=<APP_IP>`, `ServerActive=<APP_IP>` and `Hostname=<AGENT_HOSTNAME>` in `/etc/zabbix/zabbix_agent2.conf`. It then starts the agent (its port `10050` was allowed for `<APP_IP>` in step 1.3).
 
-The verification ends with two expected warnings: the database is still empty, and `log_bin_trust_function_creators` is still `1`. A third WARN about chrony is harmless if time sync has not settled yet. Then it prints the **hand-off** block and saves it as `zabbix-handoff.txt`:
+The verification ends with two expected warnings: the database is still empty, and `log_bin_trust_function_creators` is still `1`. A third WARN about chrony is harmless if time sync has not settled yet. Then it prints the **hand-off** block (password masked on screen) and saves it as `zabbix-handoff.txt`, with the real password:
 
 ```text
 # ###########################################################################
@@ -173,7 +175,10 @@ ZBX_DB_IP='<DB_IP>'
 ZBX_DB_PORT='8090'
 ...
 ZBX_DB_PASSWORD='<password>'
+...
 ```
+
+The very last block is the **REMEMBER: ZABBIX WEB WIZARD** box: Database host `<DB_IP>`, port `<DB_PORT>`, name, user, the password (the only time it is printed), the Admin login and "Next: run the script on the APP server, then open http://<APP_IP>/zabbix". The hand-off file ends with the same box as `#` comment lines, so it is still a valid env file. The verbose choice is never written to the hand-off: the app server asks its own.
 
 ### Step 2: copy the hand-off to the app server
 
@@ -193,8 +198,8 @@ sudo ./zabbix-setup.sh --mode app --env-file ./zabbix-handoff.txt
 ```
 
 - All database values, the password included, come from the file. Each one is shown as `(from env file ./zabbix-handoff.txt)`, and the password is never asked.
-- It still asks the static IP question, whether to install Agent 2 on this server, the optional Windows fields and the summary.
-- It tests the TCP port and the MySQL login, imports the schema (1–2 minutes), configures zabbix-server, Apache, PHP and the locale, then starts the services.
+- It still asks the verbose and static IP questions, whether to install Agent 2 on this server, the optional Windows fields, the ufw question and the summary.
+- It tests the TCP port and the MySQL login, imports the schema (1–2 minutes), configures zabbix-server, Apache, PHP and the locale, starts the services, and in step 2.7a enables ufw (SSH, `80/tcp`, `10051/tcp`).
 
 Under step 2.3 you usually see this warning, and the NEXT STEPS block at the end:
 
@@ -221,7 +226,7 @@ OK: schema already imported - log_bin_trust_function_creators is back to 0 (guid
 
 The schema and trust-flag warnings from step 1 are gone now: the verification ends with `Result: all checks passed (0 WARN)`. Delete `zabbix-handoff.txt` on both servers once you are done.
 
-In the web wizard on `http://<APP_IP>/zabbix`, the Database host is `<DB_IP>`, and the port must be typed as `<DB_PORT>`. **Do not leave it at 0.**
+In the web wizard on `http://<APP_IP>/zabbix`, the Database host is `<DB_IP>`, and the port must be typed as `<DB_PORT>`. **Do not leave it at 0.** The REMEMBER box at the end of the app run has all of these values. Type the IP rather than the DB server's host name unless the app server can resolve that name (DNS or `/etc/hosts`). Otherwise the wizard fails with `getaddrinfo ... Name or service not known`.
 
 ### Step 5: add the database server in the web UI (if it has the agent)
 
@@ -257,7 +262,7 @@ ZBX_DB_PASSWORD='<password>'
   - Lines starting with `#` and blank lines are ignored.
   - The file is **parsed, never sourced**: `$variables`, `$(commands)` and escapes are taken literally.
   - An unknown key gives a warning. A duplicated key, a malformed line or an invalid value stops the run and names the line number.
-- **Keys:** `ZBX_MODE`, `ZBX_APP_IP`, `ZBX_DB_IP`, `ZBX_DB_PORT`, `ZBX_DB_NAME`, `ZBX_DB_USER`, `ZBX_DB_PASSWORD`, `ZBX_TIMEZONE`, `ZBX_WIN_HOSTNAME`, `ZBX_WIN_IP`, `ZBX_IFACE`, `ZBX_STATIC_IP`, `ZBX_PREFIX`, `ZBX_GATEWAY`, `ZBX_DNS`, `ZBX_SSH_KEY_FILE`, `ZBX_INSTALL_AGENT` (`yes` or `no`), `ZBX_AGENT_HOSTNAME`, `ZBX_VERBOSE` (`1` or `0`). `ZBX_VERBOSE` is a display choice: it is accepted but never written to the generated `zabbix-setup.env`.
+- **Keys:** `ZBX_MODE`, `ZBX_APP_IP`, `ZBX_DB_IP`, `ZBX_DB_PORT`, `ZBX_DB_NAME`, `ZBX_DB_USER`, `ZBX_DB_PASSWORD`, `ZBX_TIMEZONE`, `ZBX_WIN_HOSTNAME`, `ZBX_WIN_IP`, `ZBX_IFACE`, `ZBX_STATIC_IP`, `ZBX_PREFIX`, `ZBX_GATEWAY`, `ZBX_DNS`, `ZBX_SSH_KEY_FILE`, `ZBX_SSH_PORT` (1-65535), `ZBX_INSTALL_AGENT` (`yes` or `no`), `ZBX_AGENT_HOSTNAME`, `ZBX_VERBOSE` (`yes` or `no`), `ZBX_ENABLE_UFW` (`yes` or `no`). Both are written to the generated `zabbix-setup.env`, so a re-run in the same directory repeats the choices. Neither is written to `zabbix-handoff.txt`: the app server asks its own.
 - **Priority:** flag > `ZBX_*` environment variable > env file > prompt.
 - **Loading:** `--env-file PATH`. Without that flag, `./zabbix-setup.env` is loaded automatically if it exists, and the script says so.
 - **Writing:** every real run (not `--dry-run`) writes `./zabbix-setup.env` with the settings it used, and keeps the previous copy as `zabbix-setup.env.bak`. Add `--no-env-password` to leave the password out.
@@ -366,6 +371,19 @@ The NEXT STEPS block (also in `zabbix-next-steps.txt`) has these steps with your
   - **Database server:** the agent lets the Zabbix server monitor the database machine ([Scenario B, step 5](#step-5-add-the-database-server-in-the-web-ui-if-it-has-the-agent)). The host name is asked, with the short hostname as the default. Do not use `Zabbix server`: the script warns, because it would clash with the built-in host.
   - With **no**: nothing is installed, the repository (db) and the service are not touched, no port is opened, and `--verify` shows `SKIP ... skipped (not installed by choice)`. On app/single, the built-in "Zabbix server" host then shows its agent as unavailable: disable that host or ignore it.
   - A **no** never removes an agent that is already installed. The run says "Agent 2 was already installed; leaving it as it is".
+- <a id="firewall-ufw"></a>**Firewall (ufw)**, step 1.3 (db) or 2.7a (app, single):
+  - **The script enables `ufw`.** It first lists the exact commands and asks **Enable the ufw firewall with these rules?** (default yes; `--yes` keeps the yes). The rules, in this order, each with the comment `zabbix-setup`:
+    1. **SSH first**: the port sshd really listens on, found with `sshd -T`, else `ss -ltnp`, else `/etc/ssh/sshd_config` (default 22). If none can be found, ufw is **not** enabled and the step says why. `--force` does not change that: pass `--ssh-port N` (or `ZBX_SSH_PORT=N`, 1-65535), the port you connect with. That port is also added when another one is detected (for example behind a NAT port forward).
+    2. **db:** `ufw allow from <APP_IP> to any port <DB_PORT> proto tcp`, plus the same for `10050` when the agent is installed.
+    3. **app and single:** `80/tcp` (web UI) and `10051/tcp` (active checks), the latter only from `<WIN_IP>` when you gave a Windows IP.
+    4. `ufw default deny incoming`, `ufw default allow outgoing`, `ufw --force enable`.
+  - **Changing the firewall over SSH can cut your connection**, which is why the SSH rule always goes in first. SSH's own configuration is never changed: only an allow rule is added.
+  - **Rules that already exist without the comment** (yours, or from a version before 1.4.0) count as present: they are never changed, adopted or deleted, and the log and Steps list report them as "already present (not managed by the script)". Only rules that carry the comment are added or deleted.
+  - **Re-runs:** nothing is added twice. If the DB port or an IP changed, only the old `zabbix-setup` rules are deleted and replaced; your own rules stay (there is no `ufw reset`). If ufw is already active, only the missing rules are added, the default policies are left as they are, and the Steps list says "already active". The full `ufw status numbered` goes to the log.
+  - **Opting out:** `--no-ufw` or `ZBX_ENABLE_UFW=no` (or "n" at the question): ufw is not enabled, and rules are only added if it is already active (the 1.3 behaviour).
+  - **`--verify`** checks that ufw is active, the SSH rule exists, and so do the role's rules. A missing rule or an inactive ufw is a FAIL with the exact command as the fix. After an opt-out it shows `SKIP ufw enabled by the script  skipped by choice`.
+  - `--dry-run` prints every ufw command, in order, and changes nothing.
+- **The wizard reminder.** The last thing every real run prints is the boxed **REMEMBER: ZABBIX WEB WIZARD** block: the database type, host, port, name, user and password, plus the Admin / zabbix web login that you must change. The Admin login is a different account from the database user. The database password is printed only there, once, and never in the log. The block is also saved at the end of `zabbix-next-steps.txt`, and as `#` comments at the end of `zabbix-handoff.txt`. It also gives the database server's host name, with a note: a name only works if the web server can resolve it, otherwise type the IP.
 - **`--add-user NAME`** creates a sudo user:
   - It installs an SSH public key, from `--ssh-key-file` or pasted at the prompt, with `~/.ssh` at 700 and `authorized_keys` at 600.
   - It offers to set a password, which `sudo` needs.
@@ -390,7 +408,12 @@ The NEXT STEPS block (also in `zabbix-next-steps.txt`) has these steps with your
 | Built-in "Zabbix server" host: agent unavailable | Installed with `--no-agent` / answered no: there is no agent on the server | Expected. Disable the host (*Data collection > Hosts*), ignore it, or re-run with `--agent` |
 | Wizard: `Locale for language "en_US" is not found` | Locale missing, or PHP-FPM not restarted | `sudo locale-gen en_US.UTF-8 && sudo systemctl restart php8.5-fpm` |
 | The one-liner stops at once: `bash: Argument list too long` | The old `sudo bash -c "$(curl ...)"` form: the script is over Linux's 128 KiB limit for one argument | Use `sudo bash -c 'bash <(curl -fsSL <URL>) "$@"' _ [options]`, or download the file and run it |
+| The one-liner stops at once: `bash: /dev/fd/63: No such file or directory` | `sudo bash <(curl ...)`: sudo closes the pipe that `<( )` creates | Use `sudo bash -c 'bash <(curl -fsSL <URL>) "$@"' _ [options]`, or `sudo -i` first and then `bash <(curl -fsSL <URL>) [options]` |
 | A step shows a red `[✗]` and only its last lines | The full output is in the log | `sudo less /var/log/zabbix-setup.log` (search for `[FAIL]`), or re-run with `--verbose` to watch every command |
+| SSH session dropped right after the firewall step | Your SSH port was not the one detected, or you reach the server through another port (a NAT forward, for example) | From the VM console: `sudo ufw allow <port>/tcp comment 'zabbix-setup'`, or `sudo ufw disable`. Re-run with `--no-ufw` if you manage the firewall yourself |
+| The step says `ufw NOT enabled: no SSH port detected` | No sshd on this machine, or `sshd -T` / `ss` could not find it | Expected and safe. To enable ufw anyway, re-run with `--ssh-port N` (the port you connect with). Otherwise keep `--no-ufw` |
+| `--verify`: `FAIL ufw allows ... no rule` or `FAIL ufw active` | Rule deleted or ufw disabled by hand | Run the `fix:` line shown, or re-run the script |
+| Wizard: `getaddrinfo ... Name or service not known` | A host name was typed as Database host and the web server cannot resolve it | Type the database server's IP (the REMEMBER block shows it), or add the name to `/etc/hosts` on the app server |
 | Password rejected: `no space at the start or end` | Leading or trailing space (Zabbix trims it in `zabbix_server.conf`) | Remove it; spaces inside are fine |
 | Password rejected: `control characters (tab, newline...) are not supported` / `at least 8 characters` | Tab, other control character, or too short | 8–128 printable characters; anything else, including `' " $ # \ & !`, works |
 
@@ -405,8 +428,9 @@ The NEXT STEPS block (also in `zabbix-next-steps.txt`) has these steps with your
 | Backups of every edited config | `/var/backups/zabbix-setup/<timestamp>/` (folder 700, files 600) | Yes for the copy of `zabbix_server.conf` |
 | State (role and non-secret settings, read by `--verify`) | `/etc/zabbix-setup.state` (600) | No |
 | Zabbix server config (`DBPassword=`) | `/etc/zabbix/zabbix_server.conf` | Yes (package's own permissions) |
-| Hand-off (db mode) | `./zabbix-handoff.txt` (600) | **Yes** |
-| Next steps (app/single) | `./zabbix-next-steps.txt` (600) | **Yes** |
+| Hand-off (db mode), ending with the wizard reminder as comments | `./zabbix-handoff.txt` (600) | **Yes** |
+| Next steps (app/single), ending with the wizard reminder | `./zabbix-next-steps.txt` (600) | **Yes** |
+| ufw rules (comment `zabbix-setup`) | `/etc/ufw/user.rules`, `/etc/ufw/user6.rules` (ufw's own files) | No |
 | Env file and previous copy | `./zabbix-setup.env`, `./zabbix-setup.env.bak` (600) | **Yes**, unless `--no-env-password` |
 | Manual steps (`--dry-run`) | `./zabbix-manual-steps.txt` | No (masked) |
 | Agent 2 config (db with the agent; app/single only with `--agent-hostname`) | `/etc/zabbix/zabbix_agent2.conf` | No |

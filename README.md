@@ -1,10 +1,10 @@
 # scripts
 
-Small automation scripts and guides from my sysadmin studies and homelab. The main project is [`zabbix/zabbix-setup.sh`](zabbix/zabbix-setup.sh) (version 1.4.0). It sets up the **server side** of Zabbix 8.0 LTS on Ubuntu 26.04, either on one VM or split between a database server and an app/web server. It installs MySQL, the Zabbix server, the Apache + PHP-FPM frontend and (optionally) Zabbix Agent 2 on each server, then checks the result. The Windows 11 agent stays **manual**: the script ends by printing the exact values to type on Windows and in the web UI.
+Small automation scripts and guides from my sysadmin studies and homelab. The main project is [`zabbix/zabbix-setup.sh`](zabbix/zabbix-setup.sh) (version 1.6.0). It sets up the **server side** of Zabbix 7.4 or 8.0 (your choice; 7.0 LTS also works) on Ubuntu 26.04, either on one VM or split between a database server and an app/web server. It installs MySQL, the Zabbix server, the Apache + PHP-FPM frontend and (optionally) Zabbix Agent 2 on each server, then checks the result. The Windows 11 agent stays **manual**: the script ends by printing the exact values to type on Windows and in the web UI.
 
 | Folder | What it is |
 |---|---|
-| [`zabbix/`](zabbix/) | Zabbix 8.0 LTS server setup on Ubuntu 26.04 (single VM, or database + app on two VMs), with a manual guide for the Windows 11 agent |
+| [`zabbix/`](zabbix/) | Zabbix 7.4 or 8.0 (your choice) server setup on Ubuntu 26.04 (single VM, or database + app on two VMs), with a manual guide for the Windows 11 agent |
 
 ## Requirements
 
@@ -56,6 +56,8 @@ sudo ./zabbix-setup.sh
 > sudo bash -c 'bash <(curl -fsSL https://raw.githubusercontent.com/Moonbara/scripts/zabbix-v1.1.1/zabbix/zabbix-setup.sh) "$@"' _
 > ```
 
+**Zabbix version.** Supported: **7.4** (the default, used by the course TP), **8.0 LTS** (on Ubuntu 26.04 still a release candidate; the script warns) and **7.0 LTS**. Choose it in the menu, or with `--zbx-version` / `ZBX_VERSION`. The DB server passes its choice to the app server through the hand-off file. The script checks with `curl -fsI` that the version has a package for your Ubuntu release, and stops on a 404. It never upgrades or downgrades an installed Zabbix of another version.
+
 With no options, a menu asks which role the machine has: **1** single VM, **2** database server (run it first), **3** app/web server (run it second). Output files are written to the current directory.
 
 ## What a run looks like
@@ -82,6 +84,7 @@ Each step is one line, numbered like the guide. While a step runs, its line show
 | Option | Purpose |
 |---|---|
 | `--mode single\|db\|app` | Skip the menu |
+| `--zbx-version X.Y` | Zabbix version: `7.4` (default, the course TP), `8.0` or `7.0`. Also `ZBX_VERSION=X.Y` (environment or env file). Without it, a menu asks right after the scenario |
 | `--dry-run` | Print every command and file edit, numbered like the guide, and change nothing. Saves them to `./zabbix-manual-steps.txt`. No password is needed |
 | `--verify` | Health check: PASS / WARN / FAIL table, exit code 1 on any FAIL |
 | `--env-file PATH` | Load `ZBX_*` values from a file (default: `./zabbix-setup.env` if present) |

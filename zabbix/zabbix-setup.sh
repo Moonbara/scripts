@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  zabbix-setup.sh - server-side automation of zabbix-3tier-setup-guide.md
-#  Zabbix 8.0 LTS | Ubuntu 26.04 | MySQL 8 | Apache + PHP 8.5-FPM | Agent 2
+#  Zabbix 7.4 / 8.0 / 7.0 (chosen at run time) | Ubuntu 26.04 | MySQL 8 |
+#  Apache + PHP-FPM | Agent 2
 # -----------------------------------------------------------------------------
 #  Copy this same file to every server and run it there with sudo, or start
 #  it in one line:  sudo bash -c 'bash <(curl -fsSL <SCRIPT_URL>) "$@"' _ [options]
@@ -49,17 +50,25 @@ umask 022
 # =============================================================================
 # 0. Constants and defaults - the only place versions, ports and paths live
 # =============================================================================
-readonly SCRIPT_VERSION="1.5.0"
+readonly SCRIPT_VERSION="1.6.0"
 # Optional: where the script is published. Only used to print the one-line
 # launch command (leave it empty to print <URL> instead). Pin a tag or a
 # commit instead of main for anything you rely on.
 readonly SCRIPT_URL="https://raw.githubusercontent.com/Moonbara/scripts/main/zabbix/zabbix-setup.sh"
-readonly ZBX_VERSION="8.0"
+# Zabbix versions this script can install - ONE line per version, so adding
+# a version is a one-line change:
+#   "VERSION|menu label|repository path under repo.zabbix.com/zabbix/VERSION/"
+# (7.4 and 8.0 publish zabbix-release under release/ubuntu; 7.0 keeps the
+# older layout, ubuntu). Everything version-dependent is derived from
+# ZBX_VERSION (chosen by --zbx-version / ZBX_VERSION / env file / menu).
+readonly -a ZBX_SUPPORTED=(
+  "7.4|7.4 (course TP)|release/ubuntu"
+  "8.0|8.0 LTS|release/ubuntu"
+  "7.0|7.0 LTS|ubuntu"
+)
+readonly ZBX_DEFAULT_VERSION="7.4"
 readonly TARGET_UBUNTU="26.04"
-readonly ZBX_REPO_BASE="https://repo.zabbix.com/zabbix/${ZBX_VERSION}/release/ubuntu"
-readonly -a ZBX_PACKAGES=(zabbix-server-mysql zabbix-frontend-php zabbix-apache-conf zabbix-sql-scripts zabbix-agent2)
 readonly -a APACHE_MODS=(proxy proxy_fcgi proxy_http rewrite)
-readonly DEFAULT_PHP_FPM="php8.5-fpm"
 readonly ZBX_LOCALE="en_US.UTF-8"
 
 readonly DEFAULT_DB_PORT=8090
@@ -91,9 +100,9 @@ readonly ZBX_PHP_POOL_GUESS="/etc/zabbix/php-fpm.conf"
 readonly NETPLAN_DIR="/etc/netplan"
 readonly NETPLAN_FILE="${NETPLAN_DIR}/99-zabbix-static.yaml"
 readonly LOCALE_GEN="/etc/locale.gen"
-# Zabbix 8.0 packages ship the schema under /usr/share/zabbix/sql-scripts
-# (the older /usr/share/zabbix-sql-scripts path is kept as a fallback).
-readonly -a SCHEMA_CANDIDATES=(/usr/share/zabbix/sql-scripts/mysql/server.sql.gz /usr/share/zabbix-sql-scripts/mysql/server.sql.gz)
+# The schema path differs between Zabbix versions: it is always looked up
+# with this command (never hard-coded).
+readonly SCHEMA_LOOKUP="dpkg -L zabbix-sql-scripts | grep 'mysql/server.sql.gz'"
 readonly WIN_AGENT_DIR='C:\Program Files\Zabbix Agent 2'
 readonly MASK='********'
 readonly US=$'\x1f'                  # field separator for result tables
@@ -134,7 +143,7 @@ USE_DIALOG=false; RESET_CONFIRMED=false
 #     The internal names (MODE, DB_PORT, ...) stay unprefixed.
 declare -A SRC=()
 readonly -a INPUT_VARS=(MODE APP_IP DB_IP DB_PORT DB_NAME DB_USER TIMEZONE WIN_HOSTNAME WIN_IP
-                        IFACE STATIC_IP PREFIX GATEWAY DNS SSH_KEY_FILE INSTALL_AGENT AGENT_HOSTNAME VERBOSE ENABLE_UFW SSH_PORT)
+                        IFACE STATIC_IP PREFIX GATEWAY DNS SSH_KEY_FILE INSTALL_AGENT AGENT_HOSTNAME VERBOSE ENABLE_UFW SSH_PORT VERSION)
 for _v in "${INPUT_VARS[@]}"; do
   _e="ZBX_${_v}"
   if [[ -n ${!_e:-} ]]; then printf -v "$_v" '%s' "${!_e}"; SRC[$_v]="environment ${_e}"
@@ -163,8 +172,14 @@ USER_EXISTS=false        # MySQL account already there (re-run)
 PW_KEEP=false            # keep the existing MySQL password (re-run)
 SINGLE_CUSTOM_PORT=false # single mode: TCP port instead of the default socket
 TRUST_PENDING=false      # app mode: trust flag must still be reset on the DB node
-PHP_FPM=$DEFAULT_PHP_FPM
-SCHEMA_FILE=${SCHEMA_CANDIDATES[0]}
+PHP_FPM="php-fpm"         # the real php<X.Y>-fpm unit is detected (detect_php_fpm)
+SCHEMA_FILE="\"\$(${SCHEMA_LOOKUP})\""   # shown in --dry-run; the real path: detect_schema_file
+APACHE_CONF_FILE=$ZBX_APACHE_CONF    # detect_apache_conf (from zabbix-apache-conf)
+# The Zabbix version of this run. Internally the setting is VERSION (like
+# the other inputs: --zbx-version, ZBX_VERSION env var / env-file key);
+# ask_zbx_version copies the result here.
+ZBX_VERSION=$ZBX_DEFAULT_VERSION
+ENVFILE_VERSION=""       # ZBX_VERSION found in the env file (to warn about a mismatch)
 OS_ID=""; OS_VER=""
 CUR_STEP="0"; ACTION_N=0
 APT_FRESH=false
@@ -173,7 +188,7 @@ V_ROWS=(); V_FAILS=0; V_WARNS=0
 PF_HINTS=()
 CNF=""; DBC_ARGS=()
 ST_MODE=""; ST_APP_IP=""; ST_DB_IP=""; ST_DB_PORT=""; ST_DB_NAME=""; ST_DB_USER=""; ST_TIMEZONE=""
-ST_INSTALL_AGENT=""; ST_AGENT_HOSTNAME=""; ST_ENABLE_UFW=""; ST_SSH_PORT=""
+ST_INSTALL_AGENT=""; ST_AGENT_HOSTNAME=""; ST_ENABLE_UFW=""; ST_SSH_PORT=""; ST_ZBX_VERSION=""
 SSH_PORTS=(); SSH_PORT_SRC=""; UFW_RULES=()
 
 # =============================================================================
@@ -487,13 +502,13 @@ fail_hint() {
     *"ERROR 1410"*) printf '%s' "MySQL 8 needs CREATE USER before GRANT - re-run: the script does both, in that order." ;;
     *"ERROR 1050"*) printf '%s' "A partial schema is in the way: recreate the database with --reset on the DB node, then re-run." ;;
     *AH00526*)      printf '%s' "Apache proxy modules missing: sudo a2enmod ${APACHE_MODS[*]} && sudo systemctl restart apache2" ;;
-    *"server.sql.gz: No such file"*) printf '%s' "Zabbix ${ZBX_VERSION} keeps the schema in ${SCHEMA_CANDIDATES[0]} (ls /usr/share/zabbix*/)." ;;
+    *"server.sql.gz: No such file"*) printf '%s' "The schema path depends on the Zabbix version - find it with: ${SCHEMA_LOOKUP}" ;;
     *"mysql: command not found"*) printf '%s' "Install the client: sudo apt install mysql-client -y" ;;
     *"ERROR 1045"*|*"ERROR 1130"*|*"ERROR 1049"*|*"ERROR 2002"*|*"ERROR 2003"*|*"ERROR 2005"*|*"ERROR 2059"*|*"ERROR 2061"*)
                     explain_mysql_error "$out" ;;
     *"dpkg was interrupted"*) printf '%s' "An earlier apt run was interrupted: sudo dpkg --configure -a, then run the script again." ;;
     *"Could not get lock"*) printf '%s' "Another apt/dpkg process is running (unattended-upgrades?): wait for it to finish, then run the script again." ;;
-    *"404"*"Not Found"*) printf '%s' "A 404 means a wrong repository path: it must include /release/ (zabbix/${ZBX_VERSION}/release/ubuntu/...)." ;;
+    *"404"*"Not Found"*) printf '%s' "A 404 from repo.zabbix.com: Zabbix ${ZBX_VERSION} may have no package for this Ubuntu release, or the path is wrong. Check: curl -fsI $(zbx_release_url)" ;;
   esac
   return 0
 }
@@ -527,7 +542,7 @@ steps_summary() {  # end of a real run: every step with its marker, total time
   [[ $UI != classic ]] || return 0
   step_close
   local row st line color
-  part "Steps"
+  part "Steps (Zabbix ${ZBX_VERSION})"
   for row in "${STEP_LINES[@]}"; do
     st=${row%%"$US"*}; line=${row#*"$US"}
     if [[ $st == skip ]]; then color=$C_YELLOW; else color=$C_GREEN; fi
@@ -673,7 +688,7 @@ DLG_ERR=""       # error to show at the top of the next dialog (bad input)
 # stdout (whiptail writes it to stderr: fd 3 keeps the caller's stdout, the
 # screen goes to /dev/tty, stderr goes to fd 3). Answers, passwords
 # included, are never passed as arguments.
-_dlg() { whiptail --backtitle "zabbix-setup.sh ${SCRIPT_VERSION} - Zabbix ${ZBX_VERSION} LTS" "$@" 3>&1 1>/dev/tty 2>&3 3>&-; }
+_dlg() { whiptail --backtitle "zabbix-setup.sh ${SCRIPT_VERSION} - Zabbix server setup" "$@" 3>&1 1>/dev/tty 2>&3 3>&-; }
 _dlg_text() {    # _dlg_text "message" -> message with a pending error on top
   local t=$1
   if [[ -n $DLG_ERR ]]; then t="Invalid input: ${DLG_ERR}"$'\n\n'"${t}"; DLG_ERR=""; fi
@@ -1222,7 +1237,7 @@ explain_mysql_error() {
 # =============================================================================
 usage() {
   cat <<EOF
-zabbix-setup.sh ${SCRIPT_VERSION} - Zabbix ${ZBX_VERSION} LTS server setup for Ubuntu ${TARGET_UBUNTU}
+zabbix-setup.sh ${SCRIPT_VERSION} - Zabbix $(zbx_versions) server setup for Ubuntu ${TARGET_UBUNTU}
 
 Usage: sudo ./zabbix-setup.sh [options]
    or: sudo bash -c 'bash <(curl -fsSL ${SCRIPT_URL:-<URL>}) "\$@"' _ [options]
@@ -1237,6 +1252,8 @@ current directory.
 
 Actions
   --mode single|db|app   skip the menu
+  --zbx-version X.Y      Zabbix version to install: $(zbx_versions) (default ${ZBX_DEFAULT_VERSION});
+                         without it a menu asks, right after the scenario
   --dry-run              print every command and file edit (numbered like the guide),
                          change nothing, save the list to ./zabbix-manual-steps.txt
                          (no password is needed or asked)
@@ -1295,6 +1312,8 @@ Values  (priority: flag > environment variable > env file > prompt)
                                            db default: hostname -s; app/single: Zabbix server
   --verbose / -v         ZBX_VERBOSE       yes = verbose output, no = one line per step (default)
   --no-ufw               ZBX_ENABLE_UFW    yes (default) | no
+  --zbx-version X.Y      ZBX_VERSION       $(zbx_versions) (default ${ZBX_DEFAULT_VERSION}); written to the
+                                           hand-off, so the app server uses the DB server's version
 
 There is no --db-password flag on purpose: it would leak into shell history and ps.
 
@@ -1367,6 +1386,7 @@ parse_args() {
       --agent)            INSTALL_AGENT=yes; SRC[INSTALL_AGENT]="flag --agent"; shift ;;
       --no-agent)         INSTALL_AGENT=no; SRC[INSTALL_AGENT]="flag --no-agent"; shift ;;
       --agent-hostname)   _setv AGENT_HOSTNAME "$@"; shift 2 ;;
+      --zbx-version)      _setv VERSION "$@"; shift 2 ;;
       --verbose|-v)       VERBOSE=yes; SRC[VERBOSE]="flag $1"; shift ;;
       --no-ufw)           ENABLE_UFW=no; SRC[ENABLE_UFW]="flag --no-ufw"; shift ;;
       --dry-run)          DRY_RUN=true; shift ;;
@@ -1394,7 +1414,7 @@ declare -rA ENV_VALIDATORS=(
   [DB_USER]=v_dbuser [TIMEZONE]=v_tz [WIN_HOSTNAME]=v_winhost [WIN_IP]=v_ip_opt
   [IFACE]=v_iface [STATIC_IP]=v_ip [PREFIX]=v_prefix [GATEWAY]=v_ip [DNS]=v_dns
   [SSH_KEY_FILE]=v_path [SSH_PORT]=v_ssh_port [DB_PASSWORD]=v_password [INSTALL_AGENT]=v_yesno [AGENT_HOSTNAME]=v_agent_host
-  [VERBOSE]=v_verbose [ENABLE_UFW]=v_yesno
+  [VERBOSE]=v_verbose [ENABLE_UFW]=v_yesno [VERSION]=v_zbx_version
 )
 _env_unquote() {   # _env_unquote RAW -> REPLY (outer quotes off, literal)
   local v=$1 q
@@ -1433,6 +1453,7 @@ load_env_file() {  # load_env_file PATH - fills only values no flag/env var set
     [[ -n $val ]] || continue
     [[ $name == MODE ]] && val=$(normalize_mode "$val")
     "${ENV_VALIDATORS[$name]}" "$val" || die "${f} line ${n}: ${key} is invalid: ${VERR}"
+    [[ $name == VERSION ]] && ENVFILE_VERSION=$val   # kept even when a flag wins (mismatch warning)
     if [[ $name == DB_PASSWORD ]]; then
       # never printed or logged; a flag (--db-password-file) or env var wins
       if [[ -z $PW_ORIGIN && -z $PW_FILE ]]; then DB_PASSWORD=$val; PW_ORIGIN="env file ${f}"; fi
@@ -1460,7 +1481,7 @@ load_state() {
   local line key val
   [[ -r $STATE_FILE ]] || return 0
   while IFS= read -r line || [[ -n $line ]]; do
-    [[ $line =~ ^(MODE|APP_IP|DB_IP|DB_PORT|DB_NAME|DB_USER|TIMEZONE|INSTALL_AGENT|AGENT_HOSTNAME|ENABLE_UFW|SSH_PORT)=(.*)$ ]] || continue
+    [[ $line =~ ^(MODE|APP_IP|DB_IP|DB_PORT|DB_NAME|DB_USER|TIMEZONE|INSTALL_AGENT|AGENT_HOSTNAME|ENABLE_UFW|SSH_PORT|ZBX_VERSION)=(.*)$ ]] || continue
     key=${BASH_REMATCH[1]}; val=${BASH_REMATCH[2]}
     printf -v "ST_${key}" '%s' "$val"
   done <"$STATE_FILE"
@@ -1477,6 +1498,7 @@ write_state() {
     # the Agent 2 choice (all modes) and, when installed, its host name
     printf 'INSTALL_AGENT=%s\n' "$INSTALL_AGENT"
     printf 'ENABLE_UFW=%s\n' "$ENABLE_UFW"   # read by --verify (ufw checks)
+    printf 'ZBX_VERSION=%s\n' "$ZBX_VERSION"   # read by --verify (installed version check)
     if [[ -n $SSH_PORT ]]; then printf 'SSH_PORT=%s\n' "$SSH_PORT"; fi
     if [[ $INSTALL_AGENT == yes ]]; then printf 'AGENT_HOSTNAME=%s\n' "$AGENT_HOSTNAME"; fi
   } >"${STATE_FILE}.tmp"
@@ -1732,6 +1754,46 @@ collect_inputs() {
   confirm_reset
 }
 
+# ZBX_VERSION: the Zabbix release to install. Priority flag (--zbx-version) >
+# environment (ZBX_VERSION) > env file (ZBX_VERSION=) > this menu; --yes takes
+# ZBX_DEFAULT_VERSION. The choices come from ZBX_SUPPORTED.
+ask_zbx_version() {
+  local src=${SRC[VERSION]:-} q="Which Zabbix version?" e v c n=0 rc=0
+  local -a vers=() items=()
+  for e in "${ZBX_SUPPORTED[@]}"; do v=${e%%|*}; vers+=("$v"); items+=("$v" "$(_zbx_field "$v" 2)"); done
+  if [[ -n $src ]]; then
+    v_zbx_version "$VERSION" || die "ZBX_VERSION='${VERSION}' from ${src}: ${VERR}"
+    ZBX_VERSION=$VERSION
+    say "  ${q} $(zbx_label)   (from ${src})"
+  elif [[ $ASSUME_YES == true ]]; then
+    ZBX_VERSION=$ZBX_DEFAULT_VERSION
+    say "  ${q} $(zbx_label)   (default, --yes)"
+  elif [[ $USE_DIALOG == true ]]; then
+    c=$(_dlg --title "Zabbix version" --default-item "$ZBX_DEFAULT_VERSION" --menu "${q}"$'\n'"(all of them use the same steps; only the repository and the package versions differ)" 15 76 "${#vers[@]}" "${items[@]}") || rc=$?
+    ((rc == 0)) || die "Cancelled - nothing was changed."
+    ZBX_VERSION=$c
+    _record "  ${q} ${ZBX_VERSION}"
+  else
+    say ""
+    say "${q}"
+    for v in "${vers[@]}"; do n=$((n + 1)); say "  ${n}) $(_zbx_field "$v" 2)"; done
+    while true; do
+      read -r -p "Choice [1-${n} or X.Y, Enter = ${ZBX_DEFAULT_VERSION}]: " c || die "Input ended."
+      c=${c:-$ZBX_DEFAULT_VERSION}
+      if [[ $c =~ ^[0-9]+$ ]] && ((c >= 1 && c <= n)); then c=${vers[c - 1]}; fi
+      if v_zbx_version "$c"; then ZBX_VERSION=$c; break; fi
+      warn "${VERR} - try again."
+    done
+    _record "  ${q} ${ZBX_VERSION}"
+  fi
+  VERSION=$ZBX_VERSION
+  # the hand-off (or an older env file) says another version: same on both servers
+  if [[ -n $ENVFILE_VERSION && $ENVFILE_VERSION != "$ZBX_VERSION" ]]; then
+    warn "${ENV_FILE} says ZBX_VERSION=${ENVFILE_VERSION} (the database server's run, if it is the hand-off), but this run uses ${ZBX_VERSION} (${src:-chosen here}). Use the same Zabbix version on both servers."
+  fi
+  return 0
+}
+
 # VERBOSE: every command and its live output instead of one line per step.
 # Priority flag > environment > env file > prompt; default no. Not asked in
 # --dry-run (its output does not change).
@@ -1843,7 +1905,7 @@ confirm_reset() {
 SUMMARY_LINES=()
 build_summary() {   # SUMMARY_LINES - shown as text and in the dialog (password masked)
   local net=$NET_ACTION
-  SUMMARY_LINES=("  Scenario      : ${MODE}")
+  SUMMARY_LINES=("  Scenario      : ${MODE}" "  Zabbix version: $(zbx_label)")
   case $MODE in
     db)     SUMMARY_LINES+=("  This DB server: ${DB_IP}   (port ${DB_PORT})"
                             "  App server    : ${APP_IP}  (only host allowed to log in)") ;;
@@ -1949,16 +2011,31 @@ preflight() {
   else vrow WARN "RAM >= ${MIN_RAM_MB} MB" "$((mem_kb / 1024)) MB - Zabbix may be slow"; fi
 
   # Zabbix repo (needed for app/single, and for db only when the agent is
-  # requested) - catches the 404 from a wrong path
+  # requested): does this Zabbix version have a package for this Ubuntu?
+  # A 404 stops the run before anything is installed.
   if [[ $MODE != db || $INSTALL_AGENT == yes ]]; then
+    local osv=${OS_VER:-$TARGET_UBUNTU} others
     url=$(zbx_release_url)
-    code=$(http_code "$url")
+    _action "\$ curl -fsI ${url}   # Zabbix ${ZBX_VERSION} package for Ubuntu ${osv}?"
+    code=$(curl -fsI --max-time 15 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true); code=${code:-000}
     case $code in
-      200|206) vrow PASS "repo.zabbix.com reachable" "HTTP ${code} (release .deb)" ;;
-      404) vrow FAIL "repo.zabbix.com reachable" "HTTP 404 for ${url}" "the URL must contain /release/ (zabbix/${ZBX_VERSION}/release/ubuntu/...) and Zabbix ${ZBX_VERSION} must exist for Ubuntu ${OS_VER:-$TARGET_UBUNTU}" ;;
-      000) vrow FAIL "repo.zabbix.com reachable" "no connection" "check internet access, DNS (resolvectl status) and any proxy" ;;
-      *)   vrow FAIL "repo.zabbix.com reachable" "HTTP ${code}" "open ${url} in a browser to see the error" ;;
+      200) vrow PASS "Zabbix ${ZBX_VERSION} package for Ubuntu ${osv}" "HTTP 200 (zabbix-release .deb)" ;;
+      404)
+        others=$(zbx_available_for_os)
+        vrow FAIL "Zabbix ${ZBX_VERSION} package for Ubuntu ${osv}" "HTTP 404: Zabbix ${ZBX_VERSION} has no package for this Ubuntu release (${url})" \
+          "${others:+available for Ubuntu ${osv}: ${others} (--zbx-version X.Y), or }run on an Ubuntu release that Zabbix ${ZBX_VERSION} supports (--force allows a release other than ${TARGET_UBUNTU})" ;;
+      000) vrow FAIL "Zabbix ${ZBX_VERSION} package for Ubuntu ${osv}" "no connection to repo.zabbix.com" "check internet access, DNS (resolvectl status) and any proxy" ;;
+      *)   vrow FAIL "Zabbix ${ZBX_VERSION} package for Ubuntu ${osv}" "HTTP ${code}" "open ${url} in a browser to see the error" ;;
     esac
+  fi
+  # Zabbix already installed in ANOTHER version: never upgraded or
+  # downgraded silently (the schema in the database must match too)
+  local mm
+  mm=$(zbx_version_mismatch)
+  if [[ -n $mm ]]; then
+    local mmfix="this script never upgrades or downgrades Zabbix: use a fresh VM, or sudo apt purge 'zabbix-*' and re-run with --reset (the database schema must match the version), or keep it with --zbx-version ${mm##* }"
+    if [[ $FORCE == true ]]; then vrow WARN "installed Zabbix is version ${ZBX_VERSION}" "installed: ${mm} (--force: the installed packages are left as they are)" "$mmfix"
+    else vrow FAIL "installed Zabbix is version ${ZBX_VERSION}" "installed: ${mm}" "$mmfix"; fi
   fi
 
   # Does the chosen role fit this machine?
@@ -2031,10 +2108,75 @@ preflight() {
   fi
 }
 
+# --- Zabbix version helpers: everything comes from ZBX_SUPPORTED + ZBX_VERSION
+_zbx_field() {   # _zbx_field VERSION N -> field N of its ZBX_SUPPORTED line (1 version, 2 label, 3 repo path)
+  local e
+  local -a f=()
+  for e in "${ZBX_SUPPORTED[@]}"; do
+    if [[ ${e%%|*} == "$1" ]]; then IFS='|' read -r -a f <<<"$e"; printf '%s' "${f[$2 - 1]}"; return 0; fi
+  done
+  return 1
+}
+zbx_versions() {   # "7.4, 8.0, 7.0"
+  local e out=""
+  for e in "${ZBX_SUPPORTED[@]}"; do out+="${e%%|*}, "; done
+  printf '%s' "${out%, }"
+}
+v_zbx_version() {
+  [[ -n $1 ]] && _zbx_field "$1" 1 >/dev/null && return 0
+  VERR="unsupported Zabbix version '${1}' - supported: $(zbx_versions)"; return 1
+}
+zbx_label() { _zbx_field "$ZBX_VERSION" 2 || printf '%s' "$ZBX_VERSION"; }
+# zbx_release_url [VERSION] - the zabbix-release package of VERSION (default:
+# this run's) for this Ubuntu release
 zbx_release_url() {
-  local ver=${OS_VER:-$TARGET_UBUNTU}
+  local v=${1:-$ZBX_VERSION} ver=${OS_VER:-$TARGET_UBUNTU}
   [[ $OS_ID == ubuntu ]] || ver=$TARGET_UBUNTU
-  printf '%s/pool/main/z/zabbix-release/zabbix-release_latest+ubuntu%s_all.deb' "$ZBX_REPO_BASE" "$ver"
+  printf 'https://repo.zabbix.com/zabbix/%s/%s/pool/main/z/zabbix-release/zabbix-release_latest+ubuntu%s_all.deb' \
+    "$v" "$(_zbx_field "$v" 3)" "$ver"
+}
+# The Zabbix packages of this run. If a package name ever differs between
+# versions, this is the one place to handle it (case on ZBX_VERSION).
+zbx_packages() {
+  case $ZBX_VERSION in
+    *) printf '%s\n' zabbix-server-mysql zabbix-frontend-php zabbix-apache-conf zabbix-sql-scripts zabbix-agent2 ;;
+  esac
+}
+zbx_installed_version() {   # zbx_installed_version PKG -> "7.4" (major.minor) if installed, else empty
+  local v
+  pkg_installed "$1" || return 0
+  v=$(dpkg-query -W -f='${Version}' "$1" 2>/dev/null || true); v=${v#*:}
+  [[ $v =~ ^([0-9]+\.[0-9]+) ]] && printf '%s' "${BASH_REMATCH[1]}"
+  return 0
+}
+zbx_version_mismatch() {    # installed Zabbix packages of ANOTHER version: "zabbix-server-mysql 8.0, ..."
+  local p v out=""
+  for p in zabbix-server-mysql zabbix-frontend-php zabbix-sql-scripts zabbix-agent2; do
+    v=$(zbx_installed_version "$p")
+    [[ -n $v && $v != "$ZBX_VERSION" ]] && out+="${p} ${v}, "
+  done
+  printf '%s' "${out%, }"
+}
+zbx_available_for_os() {    # the other supported versions that do have a package for this Ubuntu
+  local e v out=""
+  for e in "${ZBX_SUPPORTED[@]}"; do
+    v=${e%%|*}
+    [[ $v == "$ZBX_VERSION" ]] && continue
+    if curl -fsI --max-time 10 -o /dev/null "$(zbx_release_url "$v")" 2>/dev/null; then out+="${v}, "; fi
+  done
+  printf '%s' "${out%, }"
+}
+# A pre-release (~rc, ~beta, ~alpha) is all the repository has for this
+# version/Ubuntu (8.0 on 26.04 for a while): say so, do not hide it.
+zbx_prerelease_warning() {  # zbx_prerelease_warning PKG (after apt update)
+  [[ $DRY_RUN == true ]] && return 0
+  local c
+  c=$(apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ {print $2; exit}' || true)
+  case $c in
+    *~rc*|*~beta*|*~alpha*)
+      warn "Zabbix ${ZBX_VERSION} for Ubuntu ${OS_VER:-$TARGET_UBUNTU} is only available as a pre-release (${1} ${c}). Fine for a lab; for anything else pick a stable version with --zbx-version." ;;
+  esac
+  return 0
 }
 
 # =============================================================================
@@ -2532,18 +2674,18 @@ reset_database() {
   ok "database ${DB_NAME} dropped - it is recreated empty below"
 }
 
-# Zabbix 8.0 repository (the /release/ URL) + apt update. Used by step 2.1,
+# The Zabbix repository of ZBX_VERSION (zabbix-release package) + apt update. Used by step 2.1,
 # and by step 1.6 when the database server gets Agent 2.
 add_zabbix_repo() {
   local url deb tmpd
   url=$(zbx_release_url); deb=${url##*/}
-  if [[ $DRY_RUN != true ]] && grep -rqs "zabbix/${ZBX_VERSION}/release" /etc/apt/sources.list.d/; then
+  if [[ $DRY_RUN != true ]] && grep -rqs "repo.zabbix.com/zabbix/${ZBX_VERSION}/" /etc/apt/sources.list.d/; then
     _action "\$ wget ${url}"
     skip "the Zabbix ${ZBX_VERSION} repository is already configured"
   else
     if [[ $DRY_RUN == true ]]; then tmpd="."; else tmpd=$(mktemp -d); TMP_PATHS+=("$tmpd"); fi
     run_show "wget ${url}" fetch_url "$url" "${tmpd}/${deb}" \
-      || die "Download failed. A 404 means a wrong path: it must include /release/ (zabbix/${ZBX_VERSION}/release/ubuntu/...)." "URL: ${url}"
+      || die "Download of the Zabbix ${ZBX_VERSION} release package failed. A 404 means this version has no package for Ubuntu ${OS_VER:-$TARGET_UBUNTU}." "URL: ${url}"
     run_show "sudo dpkg -i ${deb}" dpkg -i "${tmpd}/${deb}"
     APT_FRESH=false
   fi
@@ -2559,7 +2701,7 @@ add_zabbix_repo() {
 # Only zabbix-agent2 - never a server or frontend package on this node.
 # Server=/ServerActive= point at the app server; Hostname= is AGENT_HOSTNAME.
 db_install_agent() {
-  step 1.6 "Install Zabbix Agent 2 on the database server (monitored by ${APP_IP})"
+  step 1.6 "Install Zabbix ${ZBX_VERSION} Agent 2 on the database server (monitored by ${APP_IP})"
   if [[ $INSTALL_AGENT != yes ]]; then
     say "      repository, zabbix-agent2 package, ${ZBX_AGENT_CONF}, service, ufw ${ZBX_AGENT_PORT}/tcp: (skipped: agent not requested)"
     step_skip "agent not requested"
@@ -2567,6 +2709,7 @@ db_install_agent() {
     return 0
   fi
   add_zabbix_repo
+  zbx_prerelease_warning zabbix-agent2
   apt_install "sudo apt install zabbix-agent2 -y   # the agent only: no server or frontend packages here" zabbix-agent2
   if [[ $DRY_RUN != true && ! -f $ZBX_AGENT_CONF ]]; then die "${ZBX_AGENT_CONF} is missing - did zabbix-agent2 install?"; fi
   backup_file "$ZBX_AGENT_CONF"
@@ -2628,10 +2771,11 @@ part2_app() {
   add_zabbix_repo
 
   # ---- 2.2 Packages --------------------------------------------------------------
-  step 2.2 "Install Zabbix packages (agent 2, not the classic agent)"
+  step 2.2 "Install Zabbix ${ZBX_VERSION} packages (agent 2, not the classic agent)"
   local -a pkgs=()
   local p
-  for p in "${ZBX_PACKAGES[@]}"; do
+  zbx_prerelease_warning zabbix-server-mysql
+  for p in $(zbx_packages); do
     [[ $p == zabbix-agent2 && $INSTALL_AGENT == no ]] || pkgs+=("$p")
   done
   apt_install "sudo apt install ${pkgs[*]} -y" "${pkgs[@]}"
@@ -2644,7 +2788,8 @@ part2_app() {
   else
     apt_install "sudo apt install curl -y   # used by the final HTTP check" curl
   fi
-  detect_php_fpm
+  detect_php_fpm required
+  detect_apache_conf
   detect_schema_file
   [[ $STEP_INSTALLED == true ]] || step_skip "all packages already installed"
 
@@ -2669,7 +2814,7 @@ part2_app() {
   edit_kv --secret "$ZBX_SERVER_CONF" "" DBPassword "$DB_PASSWORD" plain
 
   # ---- 2.5 Apache modules ------------------------------------------------------
-  step 2.5 "Configure Apache for PHP 8.5-FPM (proxy modules)"
+  step 2.5 "Configure Apache for ${PHP_FPM} (proxy modules)"
   run a2enmod "${APACHE_MODS[@]}"
   _action "\$ sudo apache2ctl configtest"
   if [[ $DRY_RUN != true ]]; then
@@ -2780,24 +2925,42 @@ stop_zabbix_server() {
   return 0
 }
 
+# detect_php_fpm [required] - the php<X.Y>-fpm unit the Zabbix frontend runs
+# on (its PHP version depends on Ubuntu, not on Zabbix: never hard-coded).
+# required: after step 2.2 a missing unit stops the run.
 detect_php_fpm() {
-  PHP_FPM=$DEFAULT_PHP_FPM
-  [[ $DRY_RUN == true ]] && return 0
   local u
   u=$(systemctl list-unit-files --type=service --no-legend 'php*-fpm.service' 2>/dev/null | awk '{print $1}' | sort -V | tail -n1) || u=""
-  [[ -n $u ]] && PHP_FPM=${u%.service}
+  if [[ -n $u ]]; then
+    PHP_FPM=${u%.service}
+  elif [[ $DRY_RUN == true ]]; then
+    PHP_FPM="php<X.Y>-fpm"; return 0             # not installed yet
+  elif [[ ${1:-} == required ]]; then
+    die "No php*-fpm service found after installing zabbix-frontend-php (systemctl list-unit-files 'php*-fpm.service')."
+  fi
   info "PHP-FPM service: ${PHP_FPM}"
   return 0
 }
+# The Apache config zabbix-apache-conf ships (its path is taken from the
+# package, the default is only a fallback).
+detect_apache_conf() {
+  local f
+  [[ $DRY_RUN == true ]] && return 0
+  f=$(dpkg -L zabbix-apache-conf 2>/dev/null | grep -m1 -E '^/etc/(zabbix|apache2)/.*\.conf$' || true)
+  APACHE_CONF_FILE=${f:-$ZBX_APACHE_CONF}
+  return 0
+}
+# The MySQL schema of the installed zabbix-sql-scripts: the path differs
+# between Zabbix versions, so it is always looked up, never hard-coded.
 detect_schema_file() {
   local f
-  for f in "${SCHEMA_CANDIDATES[@]}"; do
-    if [[ -f $f ]]; then SCHEMA_FILE=$f; return 0; fi
-  done
+  _action "\$ ${SCHEMA_LOOKUP}   # where Zabbix ${ZBX_VERSION} keeps the MySQL schema"
   [[ $DRY_RUN == true ]] && return 0
-  f=$(dpkg -L zabbix-sql-scripts 2>/dev/null | grep -m1 '/mysql/server.sql.gz$' || true)
-  [[ -n $f ]] || die "Cannot find mysql/server.sql.gz from zabbix-sql-scripts (step 2.2)."
+  f=$(dpkg -L zabbix-sql-scripts 2>/dev/null | grep -m1 'mysql/server.sql.gz' || true)
+  [[ -n $f && -f $f ]] || die "Cannot find the MySQL schema of Zabbix ${ZBX_VERSION}: '${SCHEMA_LOOKUP}' found nothing." \
+    "Is zabbix-sql-scripts installed (step 2.2)? Check: dpkg -l zabbix-sql-scripts"
   SCHEMA_FILE=$f
+  info "schema: ${SCHEMA_FILE}"
 }
 has_locale() { local l; l=$(locale -a 2>/dev/null || true); [[ ${l,,} == *en_us.utf8* || ${l,,} == *en_us.utf-8* ]]; }
 
@@ -2884,7 +3047,7 @@ set_php_timezone() {
   step 2.5a "Set the PHP timezone for the Zabbix frontend (${TIMEZONE}) - the wizard checks it"
   local ver=${PHP_FPM#php}; ver=${ver%-fpm}
   if [[ $DRY_RUN == true ]]; then
-    _action "inspect ${ZBX_APACHE_CONF} (SetHandler proxy:unix:<socket>) and /etc/zabbix/*.conf, /etc/php/${ver}/fpm/pool.d/*.conf for the pool listening on that socket"
+    _action "inspect ${APACHE_CONF_FILE} (SetHandler proxy:unix:<socket>) and /etc/zabbix/*.conf, /etc/php/${ver}/fpm/pool.d/*.conf for the pool listening on that socket"
     backup_file "$ZBX_PHP_POOL_GUESS"
     edit_kv "$ZBX_PHP_POOL_GUESS" zabbix "php_value[date.timezone]" "$TIMEZONE" ini
     run systemctl restart "$PHP_FPM"
@@ -2895,7 +3058,7 @@ set_php_timezone() {
   local -a cands=()
   local re_sock='proxy:unix:([^|"[:space:]]+)' re_sec='^[[:space:]]*\[([^]]+)\]' re_listen='^[[:space:]]*listen[[:space:]]*=[[:space:]]*([^[:space:];]+)'
   # 1. Which socket does Apache hand Zabbix's PHP files to?
-  for f in "$ZBX_APACHE_CONF" /etc/apache2/conf-enabled/zabbix.conf; do
+  for f in "$APACHE_CONF_FILE" /etc/apache2/conf-enabled/zabbix.conf; do
     [[ -r $f ]] || continue
     content=$(<"$f")
     if [[ $content =~ $re_sock ]]; then sock=${BASH_REMATCH[1]}; break; fi
@@ -2930,7 +3093,7 @@ set_php_timezone() {
     edit_kv "$ini" Date date.timezone "$TIMEZONE" ini
   fi
   if a2query -m "php${ver}" >/dev/null 2>&1; then
-    warn "mod_php is also enabled - the php_value date.timezone line in ${ZBX_APACHE_CONF} applies to it; edit it by hand if you use mod_php."
+    warn "mod_php is also enabled - the php_value date.timezone line in ${APACHE_CONF_FILE} applies to it; edit it by hand if you use mod_php."
   fi
   run systemctl restart "$PHP_FPM"
 }
@@ -2976,6 +3139,7 @@ render_handoff() {   # render_handoff PASSWORD_OR_MASK
 #  This file is an env file: load it with --env-file. Keep it chmod 600.
 # ###########################################################################
 ZBX_MODE='app'
+ZBX_VERSION='${ZBX_VERSION}'
 ZBX_APP_IP='${APP_IP}'
 ZBX_DB_IP='${DB_IP}'
 ZBX_DB_PORT='${DB_PORT}'
@@ -3026,6 +3190,7 @@ render_env() {   # render_env PASSWORD_OR_MASK
   printf '# from the current directory). Parsed, never sourced: values are literal.\n'
   printf '# It holds the database password: keep it chmod 600 and out of git.\n'
   _env_kv MODE "$MODE"
+  _env_kv VERSION "$ZBX_VERSION"
   _env_kv APP_IP "$APP_IP"
   [[ $MODE == app || $MODE == db ]] && _env_kv DB_IP "$DB_IP"
   if [[ $MODE == single && $SINGLE_CUSTOM_PORT != true ]]; then
@@ -3097,7 +3262,7 @@ render_next_steps() {   # render_next_steps [PASSWORD_OR_MASK - not used]
   wizard_db_target; host=$WZ_HOST; port=$WZ_PORT
   cat <<EOF
 ###########################################################################
-#  NEXT STEPS (manual)  - ${MODE} setup on ${APP_IP}, $(date '+%F %T')
+#  NEXT STEPS (manual)  - Zabbix ${ZBX_VERSION}, ${MODE} setup on ${APP_IP}, $(date '+%F %T')
 ###########################################################################
 EOF
   if [[ $TRUST_PENDING == true ]]; then
@@ -3124,7 +3289,7 @@ EOF
 
 2. Windows 11 - install Zabbix agent 2  (guide Part 3, step 1)
    Download from https://www.zabbix.com/download_agents :
-     Zabbix ${ZBX_VERSION} LTS, Windows, amd64, OpenSSL, MSI  -> run it.
+     Zabbix ${ZBX_VERSION} (the same version as the server), Windows, amd64, OpenSSL, MSI  -> run it.
    In the installer, or afterwards in ${WIN_AGENT_DIR}\\zabbix_agent2.conf:
      Hostname=${wh}
      Server=${APP_IP}
@@ -3380,6 +3545,7 @@ verify_db() {
   elif [[ -n $extra ]]; then vrow FAIL "only remote account is ${DB_USER}@${APP_IP}" "also: ${extra% }" "remove unused ones: sudo mysql -e \"DROP USER 'name'@'host';\""
   else vrow FAIL "only remote account is ${DB_USER}@${APP_IP}" "none found" "re-run: sudo ${LAUNCH} --mode db"; fi
   vc_db_agent
+  vc_zbx_version
   vc_chrony
 }
 
@@ -3401,8 +3567,19 @@ vc_db_agent() {
   vc_ufw "$ZBX_AGENT_PORT" "$APP_IP"
 }
 
+# the installed Zabbix version against ZBX_VERSION (server; agent on a db node)
+vc_zbx_version() {
+  local pkg=zabbix-server-mysql v full
+  [[ $MODE == db ]] && pkg=zabbix-agent2
+  v=$(zbx_installed_version "$pkg")
+  if [[ -z $v ]]; then vrow SKIP "Zabbix version is ${ZBX_VERSION}" "${pkg} not installed"; return 0; fi
+  full=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)
+  if [[ $v == "$ZBX_VERSION" ]]; then vrow PASS "Zabbix version is ${ZBX_VERSION}" "${pkg} ${full}"
+  else vrow WARN "Zabbix version is ${ZBX_VERSION}" "installed: ${pkg} ${full}" "a different version is installed - use a fresh VM, or sudo apt purge 'zabbix-*' and re-run with --reset"; fi
+}
 verify_app() {
   local s h p n u pw out m code recent errs
+  vc_zbx_version
   while IFS= read -r s; do vc_service "$s"; done < <(app_services)
   if [[ $INSTALL_AGENT == no ]]; then vrow SKIP "service zabbix-agent2 active" "skipped (not installed by choice)"; fi
   vc_listen "$ZBX_TRAPPER_PORT" "zabbix-server" "check ${ZBX_SERVER_LOG}; sudo systemctl restart zabbix-server"
@@ -3549,6 +3726,16 @@ resolve_verify_settings() {
   # ufw choice: flag/env/env file, else the state file; older state = no
   if [[ -n $ENABLE_UFW ]] && ! v_yesno "$ENABLE_UFW"; then die "ENABLE_UFW='${ENABLE_UFW}' from ${SRC[ENABLE_UFW]:-?}: ${VERR}"; fi
   ENABLE_UFW=${ENABLE_UFW:-${ST_ENABLE_UFW:-no}}; ENABLE_UFW=${ENABLE_UFW,,}
+  # Zabbix version: flag/env/env file, else the state file, else what is installed
+  if [[ -n $VERSION ]]; then
+    v_zbx_version "$VERSION" || die "ZBX_VERSION='${VERSION}' from ${SRC[VERSION]:-?}: ${VERR}"
+    ZBX_VERSION=$VERSION
+  elif [[ -n $ST_ZBX_VERSION ]]; then
+    ZBX_VERSION=$ST_ZBX_VERSION
+  else
+    local iv; iv=$(zbx_installed_version zabbix-server-mysql); [[ -n $iv ]] || iv=$(zbx_installed_version zabbix-agent2)
+    ZBX_VERSION=${iv:-$ZBX_DEFAULT_VERSION}
+  fi
   [[ -n $SSH_PORT ]] || SSH_PORT=$ST_SSH_PORT   # --ssh-port of the last run (no SSH detected)
   if [[ -n $AGENT_HOSTNAME ]] && ! v_agent_host "$AGENT_HOSTNAME"; then die "AGENT_HOSTNAME='${AGENT_HOSTNAME}': ${VERR}"; fi
   [[ -n $AGENT_HOSTNAME ]] || AGENT_HOSTNAME=${ST_AGENT_HOSTNAME:-$(kv_get "$ZBX_AGENT_CONF" "" Hostname || true)}
@@ -3576,7 +3763,7 @@ main() {
   parse_args "$@"
   if [[ $SHOW_HELP == true ]]; then usage; exit 0; fi
   init_output
-  _emit "$C_BOLD" "zabbix-setup.sh ${SCRIPT_VERSION} - Zabbix ${ZBX_VERSION} LTS on Ubuntu ${TARGET_UBUNTU}$([[ $DRY_RUN == true ]] && echo '   [DRY RUN - nothing will be changed]')"
+  _emit "$C_BOLD" "zabbix-setup.sh ${SCRIPT_VERSION} - Zabbix server setup ($(zbx_versions)) on Ubuntu ${TARGET_UBUNTU}$([[ $DRY_RUN == true ]] && echo '   [DRY RUN - nothing will be changed]')"
   [[ $LOG_ON == true ]] && say "Log: ${LOG_FILE}"
   say "Output files (hand-off, env file, next steps, manual steps) go to: ${OUT_DIR}"
   if [[ $PW_ENV_DEPRECATED == true ]]; then warn "DB_PASSWORD is deprecated - use ZBX_DB_PASSWORD (same meaning)."; fi
@@ -3606,6 +3793,7 @@ main() {
 
   load_state
   choose_mode
+  ask_zbx_version                             # right after the scenario menu
   if [[ $DRY_RUN == true ]]; then
     say "Scenario: ${MODE}. Every command below is numbered with the guide's Part.Step."
     say "Saved to: ${MANUAL_FILE} (password masked)."

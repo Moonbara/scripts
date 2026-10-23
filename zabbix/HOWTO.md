@@ -1,6 +1,6 @@
 # zabbix-setup.sh: how to use it
 
-Step-by-step usage of [`zabbix-setup.sh`](zabbix-setup.sh) version 1.4.0: Zabbix 8.0 LTS server side on Ubuntu 26.04. The manual procedure it automates is in [`zabbix-3tier-setup-guide.md`](zabbix-3tier-setup-guide.md).
+Step-by-step usage of [`zabbix-setup.sh`](zabbix-setup.sh) version 1.6.0: Zabbix 7.4 or 8.0 (your choice) server side on Ubuntu 26.04. The manual procedure it automates is in [`zabbix-3tier-setup-guide.md`](zabbix-3tier-setup-guide.md).
 
 ## Contents
 
@@ -71,7 +71,7 @@ Add `--no-dialog` for plain text prompts.
 - When it ends: green `[✓]` and the duration, or yellow `[-]` with the reason when there was nothing to do.
 
 ```text
-( 9/19) [✓] 2.1 Add the Zabbix 8.0 repository (Ubuntu 26.04) (20s)
+( 9/19) [✓] 2.1 Add the Zabbix 7.4 repository (Ubuntu 26.04) (20s)
 (10/19) [✓] 2.2 Install Zabbix packages (agent 2, not the classic agent) (31s)
 (11/19) [✗] 2.3 Import the schema... ⠼          <- running
 ```
@@ -96,6 +96,23 @@ Add `--no-dialog` for plain text prompts.
 
 Pick the option that matches **this** machine. The script stops early if you get it wrong. For example, it stops on db mode on a machine that already has zabbix-server, or on an app server IP that belongs to the machine itself.
 
+### Choosing the Zabbix version
+
+Right after the scenario, the script asks **Which Zabbix version?**:
+
+| Choice | Use it for |
+|---|---|
+| `7.4 (course TP)` | The default: what the course TP uses. A stable release. |
+| `8.0 LTS` | The newest LTS. On Ubuntu 26.04 it is still a release candidate (`8.0.0~rc…`), and the script warns about that. |
+| `7.0 LTS` | The previous LTS, still supported. |
+
+- **Answer it in advance** with `--zbx-version 7.4`, `ZBX_VERSION=7.4` in the environment (`sudo --preserve-env=ZBX_VERSION ...`), or `ZBX_VERSION=7.4` in an env file. The priority is the usual one: flag > environment > env file > question. `--yes` without any of them takes the default, `7.4`. Any other value stops with `unsupported Zabbix version 'X' - supported: 7.4, 8.0, 7.0`.
+- **Two VMs:** choose the version on the DB server. It goes into `zabbix-handoff.txt`, so the app server uses the same one without asking. If you override it there, the script warns.
+- **What changes with the version:** only the repository URL (checked first with `curl -fsI`, and a 404 stops the run) and the packages installed from it. The schema path (`dpkg -L zabbix-sql-scripts`), the PHP-FPM unit and the Apache config are detected, never hard-coded.
+- **Changing version later:** the script never upgrades or downgrades an installed Zabbix. With another version installed, it stops at the preflight check. Use a fresh VM (simplest), or purge the Zabbix packages and re-run with `--reset`.
+- `--verify` reports the installed version: `PASS Zabbix version is 7.4`, or a WARN if it differs from what the setup expects.
+- **Adding a version** is one line in the `ZBX_SUPPORTED` array at the top of the script; the default is `ZBX_DEFAULT_VERSION`.
+
 ---
 
 ## 3. Scenario A: single VM
@@ -106,17 +123,18 @@ sudo ./zabbix-setup.sh --mode single
 
 The script asks, in this order:
 
-1. **Show detailed output (verbose)?** Default no: one line per step. See [Output](#1-before-you-start).
-2. **Does this server already have a static IP?** The default is "yes" when the address is not a DHCP lease. See [Static IP](#7-static-ip).
-3. **This server's IP (APP_IP)**: pre-filled with the detected address.
-4. **Use the default MySQL setup (local socket, port 0 in the wizard)?** Answer **yes** unless you were told to use a port. If you answer no, the next question is **Custom MySQL port**, and Zabbix will then connect over TCP to `127.0.0.1:<port>`.
-5. **Database name** and **Database user**: both default to `zabbix`.
-6. **DB password (press Enter to generate one)**: typed twice, or Enter for a random 20-character password.
-7. **Timezone**: default `America/Toronto`.
-8. **Install Zabbix Agent 2 on this server (it monitors this server itself, not the Windows PC)?** Default yes. See [Agent 2 on the server](#agent-2-on-the-server).
-9. **Windows host name / Windows IP**: optional. They fill in the printed Windows steps, and the IP also limits the ufw rule for port 10051.
-10. **Enable the ufw firewall with these rules?** The exact rules are listed first. Default yes. See [Firewall](#firewall-ufw).
-11. **Summary**: check it, then confirm. Nothing changes before this point.
+1. **Which Zabbix version?** `7.4 (course TP)` (default), `8.0 LTS` or `7.0 LTS`, asked right after the scenario. See [Choosing the Zabbix version](#choosing-the-zabbix-version).
+2. **Show detailed output (verbose)?** Default no: one line per step. See [Output](#1-before-you-start).
+3. **Does this server already have a static IP?** The default is "yes" when the address is not a DHCP lease. See [Static IP](#7-static-ip).
+4. **This server's IP (APP_IP)**: pre-filled with the detected address.
+5. **Use the default MySQL setup (local socket, port 0 in the wizard)?** Answer **yes** unless you were told to use a port. If you answer no, the next question is **Custom MySQL port**, and Zabbix will then connect over TCP to `127.0.0.1:<port>`.
+6. **Database name** and **Database user**: both default to `zabbix`.
+7. **DB password (press Enter to generate one)**: typed twice, or Enter for a random 20-character password.
+8. **Timezone**: default `America/Toronto`.
+9. **Install Zabbix Agent 2 on this server (it monitors this server itself, not the Windows PC)?** Default yes. See [Agent 2 on the server](#agent-2-on-the-server).
+10. **Windows host name / Windows IP**: optional. They fill in the printed Windows steps, and the IP also limits the ufw rule for port 10051.
+11. **Enable the ufw firewall with these rules?** The exact rules are listed first. Default yes. See [Firewall](#firewall-ufw).
+12. **Summary**: check it, then confirm. Nothing changes before this point.
 
 What you should see next:
 
@@ -154,7 +172,7 @@ Follow this exact order:
 sudo ./zabbix-setup.sh --mode db --app-ip <APP_IP>
 ```
 
-It asks the verbose question, the static IP, the **Database port?** (default `8090`), the database name and user, the password and the timezone. Then comes **Install Zabbix Agent 2 on this database server so the Zabbix server can monitor it?** (default yes), and with yes, the **Agent host name** (default: the short hostname), and finally whether to enable ufw. Then it:
+It asks the Zabbix version (written to the hand-off for the app server), the verbose question, the static IP, the **Database port?** (default `8090`), the database name and user, the password and the timezone. Then comes **Install Zabbix Agent 2 on this database server so the Zabbix server can monitor it?** (default yes), and with yes, the **Agent host name** (default: the short hostname), and finally whether to enable ufw. Then it:
 
 - installs MySQL
 - sets `bind-address = 0.0.0.0` and `port = <DB_PORT>`
@@ -262,7 +280,7 @@ ZBX_DB_PASSWORD='<password>'
   - Lines starting with `#` and blank lines are ignored.
   - The file is **parsed, never sourced**: `$variables`, `$(commands)` and escapes are taken literally.
   - An unknown key gives a warning. A duplicated key, a malformed line or an invalid value stops the run and names the line number.
-- **Keys:** `ZBX_MODE`, `ZBX_APP_IP`, `ZBX_DB_IP`, `ZBX_DB_PORT`, `ZBX_DB_NAME`, `ZBX_DB_USER`, `ZBX_DB_PASSWORD`, `ZBX_TIMEZONE`, `ZBX_WIN_HOSTNAME`, `ZBX_WIN_IP`, `ZBX_IFACE`, `ZBX_STATIC_IP`, `ZBX_PREFIX`, `ZBX_GATEWAY`, `ZBX_DNS`, `ZBX_SSH_KEY_FILE`, `ZBX_SSH_PORT` (1-65535), `ZBX_INSTALL_AGENT` (`yes` or `no`), `ZBX_AGENT_HOSTNAME`, `ZBX_VERBOSE` (`yes` or `no`), `ZBX_ENABLE_UFW` (`yes` or `no`). Both are written to the generated `zabbix-setup.env`, so a re-run in the same directory repeats the choices. Neither is written to `zabbix-handoff.txt`: the app server asks its own.
+- **Keys:** `ZBX_MODE`, `ZBX_APP_IP`, `ZBX_DB_IP`, `ZBX_DB_PORT`, `ZBX_DB_NAME`, `ZBX_DB_USER`, `ZBX_DB_PASSWORD`, `ZBX_TIMEZONE`, `ZBX_WIN_HOSTNAME`, `ZBX_WIN_IP`, `ZBX_IFACE`, `ZBX_STATIC_IP`, `ZBX_PREFIX`, `ZBX_GATEWAY`, `ZBX_DNS`, `ZBX_SSH_KEY_FILE`, `ZBX_SSH_PORT` (1-65535), `ZBX_INSTALL_AGENT` (`yes` or `no`), `ZBX_AGENT_HOSTNAME`, `ZBX_VERBOSE` (`yes` or `no`), `ZBX_ENABLE_UFW` (`yes` or `no`), `ZBX_VERSION` (`7.4`, `8.0` or `7.0`; also written to the hand-off). Both are written to the generated `zabbix-setup.env`, so a re-run in the same directory repeats the choices. Neither is written to `zabbix-handoff.txt`: the app server asks its own.
 - **Priority:** flag > `ZBX_*` environment variable > env file > prompt.
 - **Loading:** `--env-file PATH`. Without that flag, `./zabbix-setup.env` is loaded automatically if it exists, and the script says so.
 - **Writing:** every real run (not `--dry-run`) writes `./zabbix-setup.env` with the settings it used, and keeps the previous copy as `zabbix-setup.env.bak`. Add `--no-env-password` to leave the password out.
@@ -327,7 +345,7 @@ sudo ./zabbix-setup.sh --mode db --app-ip <APP_IP> --static-ip <DB_IP> --apply-n
 
 The NEXT STEPS block (also in `zabbix-next-steps.txt`) has these steps with your real values filled in.
 
-1. **Install Zabbix Agent 2.** Download it from <https://www.zabbix.com/download_agents>: choose Zabbix 8.0 LTS, Windows, amd64, OpenSSL, MSI, and run the installer.
+1. **Install Zabbix Agent 2.** Download it from <https://www.zabbix.com/download_agents>: choose the same Zabbix version as the server (7.4 or 8.0), Windows, amd64, OpenSSL, MSI, and run the installer.
 2. **Configure it**, either in the installer or in `C:\Program Files\Zabbix Agent 2\zabbix_agent2.conf`:
 
    ```ini
@@ -399,14 +417,16 @@ The NEXT STEPS block (also in `zabbix-next-steps.txt`) has these steps with your
 | App mode stops: `DB server <DB_IP>:<DB_PORT> answers ... no TCP answer within 3 s`, or `ERROR 2003` connection refused | db mode not run yet, MySQL down, `bind-address` still `127.0.0.1`, or `ufw` blocking the port | On the DB server: run db mode, `sudo systemctl status mysql`, check `/etc/mysql/mysql.conf.d/mysqld.cnf`, `sudo ufw status` |
 | Same error, but the DB server looks fine | **Port mismatch:** the app side uses another `--db-port` than the DB side | `sudo ss -ltn \| grep mysqld` on the DB server. Use the port from `zabbix-handoff.txt` (`--env-file` does this for you) |
 | `ERROR 1130 Host not allowed` or `ERROR 1045 Access denied` | User created for another app IP, or wrong password | Re-run db mode with `--app-ip <APP_IP>`; reuse the hand-off password |
-| Preflight: `repo.zabbix.com reachable ... HTTP 404` | Wrong repository path or Ubuntu version | The URL must contain `/release/` (`zabbix/8.0/release/ubuntu/...`); use Ubuntu 26.04 |
+| Preflight: `Zabbix X.Y package for Ubuntu ... HTTP 404: Zabbix X.Y has no package for this Ubuntu release` | That version has no package for your Ubuntu release | Pick a version the `fix:` line lists as available (`--zbx-version`), or use an Ubuntu release that version supports (`--force` allows one other than 26.04) |
+| Preflight: `FAIL installed Zabbix is version X.Y ... installed: zabbix-server-mysql A.B` | Another Zabbix version is already installed on this VM | The script never upgrades or downgrades Zabbix. Use a fresh VM, or `sudo apt purge 'zabbix-*'` and re-run with `--reset`, or keep the installed one with `--zbx-version A.B` |
+| `WARNING: ... says ZBX_VERSION=7.4 ..., but this run uses 8.0` | The app server was given another version than the DB server's hand-off | Use the same version on both servers: drop the `--zbx-version` flag and let the hand-off decide |
 | Web wizard cannot connect, but `mysql -h <DB_IP> -P <DB_PORT>` works | Database port left at `0`, which means 3306 | Type `<DB_PORT>` in the wizard. Single VM with a custom port: host `127.0.0.1` plus that port |
 | Host is grey / "unknown", no data | Host name mismatch, firewall, or agent not restarted | Host name must match `Hostname=` exactly; check `zabbix_agent2.log`; `Test-NetConnection <APP_IP> -Port 10051`; restart "Zabbix Agent 2" |
 | Saving the host fails with `Cannot inherit item with key "agent.hostname" of template "Windows by Zabbix agent" to host "<name>", because a host interface of type "Agent" is required.` (as seen on Zabbix 8.0; the wording may differ slightly between versions) | Template linked, but the host has no Agent interface | *Interfaces > Add > Agent*, `<WIN_IP>` port `10050`, then save again |
 | A re-run pauses about 60 s at step 2.7, then `zabbix-server did not stop within 60 s` | Port or DB IP changed. The old process flushes its cache to a database it can no longer reach | Expected: the script kills it and continues. Unsent history is lost |
 | Database server host: agent unavailable | `Hostname=` differs from the host name in the UI, `ufw` blocks 10050, or `Server=` is not `<APP_IP>` | `sudo ./zabbix-setup.sh --verify` on the DB server checks all three. The UI host name must equal `Hostname=` exactly |
 | Built-in "Zabbix server" host: agent unavailable | Installed with `--no-agent` / answered no: there is no agent on the server | Expected. Disable the host (*Data collection > Hosts*), ignore it, or re-run with `--agent` |
-| Wizard: `Locale for language "en_US" is not found` | Locale missing, or PHP-FPM not restarted | `sudo locale-gen en_US.UTF-8 && sudo systemctl restart php8.5-fpm` |
+| Wizard: `Locale for language "en_US" is not found` | Locale missing, or PHP-FPM not restarted | `sudo locale-gen en_US.UTF-8 && sudo systemctl restart php8.5-fpm` (Ubuntu 26.04's PHP; check with `systemctl list-unit-files 'php*-fpm.service'`) |
 | The one-liner stops at once: `bash: Argument list too long` | The old `sudo bash -c "$(curl ...)"` form: the script is over Linux's 128 KiB limit for one argument | Use `sudo bash -c 'bash <(curl -fsSL <URL>) "$@"' _ [options]`, or download the file and run it |
 | The one-liner stops at once: `bash: /dev/fd/63: No such file or directory` | `sudo bash <(curl ...)`: sudo closes the pipe that `<( )` creates | Use `sudo bash -c 'bash <(curl -fsSL <URL>) "$@"' _ [options]`, or `sudo -i` first and then `bash <(curl -fsSL <URL>) [options]` |
 | A step shows a red `[✗]` and only its last lines | The full output is in the log | `sudo less /var/log/zabbix-setup.log` (search for `[FAIL]`), or re-run with `--verbose` to watch every command |

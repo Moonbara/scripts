@@ -1,4 +1,6 @@
-# Zabbix 8.0 LTS — 3-Tier Setup Guide (Ubuntu 26.04 + Remote MySQL + Windows 11)
+# Zabbix 7.4 or 8.0 (your choice) — 3-Tier Setup Guide (Ubuntu 26.04 + Remote MySQL + Windows 11)
+
+> **7.4 vs 8.0:** every step is the same. Only the version in the repository URL (`zabbix/<ZBX_VERSION>/release/ubuntu/...`) and the package versions differ, and the schema path is found with `dpkg -L zabbix-sql-scripts | grep 'mysql/server.sql.gz'` instead of being typed. (7.4 and 8.0 both keep it in `/usr/share/zabbix/sql-scripts/`. The older 7.0 LTS, which the script also supports, uses `zabbix/7.0/ubuntu/...` without `/release/` and `/usr/share/zabbix-sql-scripts/`.)
 
 Dedicated 3-tier deployment: a separate App/Web node, a remote MySQL Database node, and a monitored Windows 11 agent host — monitoring CPU, RAM, and storage.
 
@@ -16,18 +18,19 @@ Fill these in for your environment, then swap them into the commands below.
 | `<WIN_HOSTNAME>` | Hostname/Host name of the Windows agent | `CapyWin` |
 | `<AGENT_HOSTNAME>` | `Hostname=` of the optional Agent 2 on the DB node (Part 1 step 6); usually its short hostname | `capydb` |
 | `<WIN_IP>` | IP of the Windows 11 machine | `10.4.0.38` |
+| `<ZBX_VERSION>` | Zabbix version: `7.4` or `8.0` (the script also accepts `7.0`) | `7.4` |
 
 > Ubuntu 26.04 ships PHP 8.5-FPM by default rather than `mod_php`, which is why this guide's Apache setup differs from a standard 24.04 install (PHP-FPM needs Apache's proxy modules to hand off requests, instead of `php_value` directives in `apache.conf`).
 
 > Ubuntu 26.04's `mysql-server` package installs **MySQL 8.4** (LTS), not 8.0. Every SQL statement in this guide is unchanged on 8.4; the 8.0 rules below (such as `CREATE USER` before `GRANT`) still apply.
 
-> At the time of writing, the Zabbix 8.0 packages in the official repository may still be a **release candidate** (for example `8.0.0~rc1`). Check with `apt policy zabbix-server-mysql` after Part 2 step 1.
+> **Only if you choose 8.0:** for Ubuntu 26.04 the official repository currently has 8.0 only as a **release candidate** (for example `8.0.0~rc2`). 7.4 is a stable release. Check with `apt policy zabbix-server-mysql` after Part 2 step 1; the script warns by itself when only a pre-release is available.
 
 ## Infrastructure
 
 | Role | Hostname | IP Address | OS / Software |
 |---|---|---|---|
-| App & Web Server | `<APP_HOSTNAME>` | `<APP_IP>` | Ubuntu 26.04 LTS (Resolute Raccoon), Zabbix Server 8.0 LTS, Apache 2, PHP 8.5-FPM |
+| App & Web Server | `<APP_HOSTNAME>` | `<APP_IP>` | Ubuntu 26.04 LTS (Resolute Raccoon), Zabbix Server `<ZBX_VERSION>` (7.4 or 8.0), Apache 2, PHP 8.5-FPM (Ubuntu's PHP, the same for every Zabbix version) |
 | Database Server | (remote DB node) | `<DB_IP>` | Ubuntu 26.04 LTS, MySQL 8.4 (Ubuntu's `mysql-server` package) |
 | Monitored Client | `<WIN_HOSTNAME>` | `<WIN_IP>` | Windows 11, Zabbix Agent 2 |
 
@@ -121,9 +124,9 @@ mysql -h <DB_IP> -P <DB_PORT> -u zabbix -p
 If this connects, everything in Part 1 is solid and any later connection issue is a Zabbix-side config problem, not MySQL. If it refuses to connect, check in this order: MySQL is running (`sudo systemctl status mysql`), `bind-address` is `0.0.0.0` not `127.0.0.1`, `port` in `mysqld.cnf` matches `<DB_PORT>`, and `ufw` (step 3 above) isn't blocking it.
 
 ### 6. (Optional) Install Zabbix Agent 2 on the DB node
-This lets the Zabbix server monitor the database server itself. Install **only** the agent here: no server or frontend packages. Use the same repository as Part 2 step 1:
+This lets the Zabbix server monitor the database server itself. Install **only** the agent here: no server or frontend packages. Use the same repository (and the same `<ZBX_VERSION>`) as Part 2 step 1:
 ```bash
-wget https://repo.zabbix.com/zabbix/8.0/release/ubuntu/pool/main/z/zabbix-release/zabbix-release_latest+ubuntu26.04_all.deb
+wget https://repo.zabbix.com/zabbix/<ZBX_VERSION>/release/ubuntu/pool/main/z/zabbix-release/zabbix-release_latest+ubuntu26.04_all.deb
 sudo dpkg -i zabbix-release_latest+ubuntu26.04_all.deb
 sudo apt update
 sudo apt install zabbix-agent2 -y
@@ -155,28 +158,30 @@ Once Part 2 is done, add it in the web UI under **Data collection → Hosts → 
 
 ### 1. Add the Zabbix repository (Ubuntu 26.04 "resolute")
 ```bash
-wget https://repo.zabbix.com/zabbix/8.0/release/ubuntu/pool/main/z/zabbix-release/zabbix-release_latest+ubuntu26.04_all.deb
+curl -fsI https://repo.zabbix.com/zabbix/<ZBX_VERSION>/release/ubuntu/pool/main/z/zabbix-release/zabbix-release_latest+ubuntu26.04_all.deb   # 200 = this version exists for 26.04; 404 = it does not
+wget https://repo.zabbix.com/zabbix/<ZBX_VERSION>/release/ubuntu/pool/main/z/zabbix-release/zabbix-release_latest+ubuntu26.04_all.deb
 sudo dpkg -i zabbix-release_latest+ubuntu26.04_all.deb
 sudo add-apt-repository universe -y
 sudo apt update
 ```
-> Zabbix's repo path now includes a `/release/` segment (`zabbix/8.0/release/ubuntu/...`) — older guides or cached commands without it will 404.
+> For 7.4 and 8.0 the repo path includes a `/release/` segment (`zabbix/<ZBX_VERSION>/release/ubuntu/...`). Older guides or cached commands without it will 404. Only 7.0 still uses `zabbix/7.0/ubuntu/...`. Use the **same** `<ZBX_VERSION>` on the app server and the DB node.
 
 ### 2. Install Zabbix packages
 ```bash
 sudo apt install zabbix-server-mysql zabbix-frontend-php zabbix-apache-conf zabbix-sql-scripts zabbix-agent2 mysql-client -y
 ```
-> Zabbix 8.0's official examples install `zabbix-agent2` by default rather than the classic `zabbix-agent` — this also monitors the app server itself, separate from the Agent 2 you're installing on the Windows client in Part 3.
+> Zabbix's official examples (7.4 and 8.0) install `zabbix-agent2` by default rather than the classic `zabbix-agent` — this also monitors the app server itself, separate from the Agent 2 you're installing on the Windows client in Part 3.
 
 > `mysql-client` provides the `mysql` command used for the connection test (Part 1 step 5) and the schema import (step 3 below). The app server has no MySQL server of its own.
 
 ### 3. Import the schema to the remote DB node
 ```bash
-zcat /usr/share/zabbix/sql-scripts/mysql/server.sql.gz | mysql -h <DB_IP> -P <DB_PORT> -u zabbix -p --default-character-set=utf8mb4 zabbix
+dpkg -L zabbix-sql-scripts | grep 'mysql/server.sql.gz'      # where this version keeps the schema
+zcat "$(dpkg -L zabbix-sql-scripts | grep 'mysql/server.sql.gz')" | mysql -h <DB_IP> -P <DB_PORT> -u zabbix -p --default-character-set=utf8mb4 zabbix
 ```
 Enter `<DB_PASSWORD>` when prompted — this runs for 1–2 minutes. `--default-character-set=utf8mb4` makes the client send the data in the same character set as the database.
 
-> Zabbix 8.0 ships the schema under `/usr/share/zabbix/sql-scripts/`. The older `/usr/share/zabbix-sql-scripts/` path found in many guides does not exist in 8.0. If unsure, look: `ls /usr/share/zabbix*/`
+> The schema path depends on the Zabbix version: 7.4 and 8.0 use `/usr/share/zabbix/sql-scripts/mysql/server.sql.gz`, 7.0 uses `/usr/share/zabbix-sql-scripts/mysql/server.sql.gz`. Let `dpkg -L` find it rather than typing it.
 
 Once it finishes, reconnect to the **DB node** (`<DB_IP>`) and turn the trust setting back off. This has to happen on the DB node (`sudo mysql`): the `zabbix` account cannot change global settings from the app server.
 ```sql
@@ -211,7 +216,7 @@ DBPassword=<DB_PASSWORD>
   ```
   Import with `-h 127.0.0.1 -P <DB_PORT>` (step 3). In the wizard, use Database host `127.0.0.1` and port `<DB_PORT>`.
 
-### 5. Configure Apache for PHP 8.5-FPM
+### 5. Configure Apache for PHP-FPM (`php8.5-fpm` on Ubuntu 26.04)
 ```bash
 sudo a2enmod proxy proxy_fcgi proxy_http rewrite
 ```
@@ -315,7 +320,7 @@ Check **Monitoring → Latest data** filtered to `<WIN_HOSTNAME>` — CPU, memor
 | Host shows grey "unknown" status with no data | See full checklist below. |
 | `ERROR 2003 (HY000): Can't connect to MySQL server on '<DB_IP>'` (connection refused, not access denied) | This means nothing is reachable at all — check, in order: `sudo systemctl status mysql` on the DB node (is it running?), `bind-address` in `mysqld.cnf` (must be `0.0.0.0`, resets to `127.0.0.1` on fresh installs), `port` in `mysqld.cnf` matches `<DB_PORT>`, and `sudo ufw status` on the DB node (the port may be blocked by default on a fresh Ubuntu 26.04 image). |
 | Zabbix web wizard connection test fails even though `mysql -h <DB_IP> -P <DB_PORT>` works manually | The wizard's **Database port** field was left at `0`. `0` only means "use the default port" (3306) — with a custom port you must type `<DB_PORT>` into that field explicitly. |
-| `zcat: /usr/share/zabbix-sql-scripts/mysql/server.sql.gz: No such file or directory` | Zabbix 8.0 moved the schema to `/usr/share/zabbix/sql-scripts/mysql/server.sql.gz`. Find it with `ls /usr/share/zabbix*/`. |
+| `zcat: .../mysql/server.sql.gz: No such file or directory` | The schema path differs between Zabbix versions (7.4/8.0: `/usr/share/zabbix/sql-scripts/`, 7.0: `/usr/share/zabbix-sql-scripts/`). Find it with `dpkg -L zabbix-sql-scripts \| grep 'mysql/server.sql.gz'`. |
 | `mysql: command not found` on the app server | Install the client: `sudo apt install mysql-client -y` (Part 2 step 2). |
 | `systemctl restart zabbix-server` never returns after the DB port/IP changed | The old process is flushing its cache to an unreachable database (no stop timeout). `sudo timeout 60 systemctl stop zabbix-server \|\| sudo systemctl kill --signal=SIGKILL zabbix-server`, then start it again. |
 | Web wizard warns about the PHP time zone | Set `php_value[date.timezone]` in the PHP-FPM pool (Part 2 step 5a) and restart `php8.5-fpm`. The `php_value` lines in `apache.conf` only apply to `mod_php`. |
@@ -333,6 +338,8 @@ Check **Monitoring → Latest data** filtered to `<WIN_HOSTNAME>` — CPU, memor
 
 [`zabbix-setup.sh`](zabbix-setup.sh) performs Parts 1 and 2 with the same step numbers as this guide (plus Part 0 for preparation, the optional Part 1 step 6, and steps 2.5a / 2.7a). Run it as `sudo ./zabbix-setup.sh`, or with the one-liner from [Run it](#run-it-automation). With no options it shows a menu; on a terminal, prompts are whiptail dialogs (`--no-dialog` for plain text).
 
+**Zabbix version:** right after the scenario menu it asks **Which Zabbix version?** with the choices `7.4 (course TP)` (the default), `8.0 LTS` and `7.0 LTS`. You can answer in advance with `--zbx-version X.Y`, `ZBX_VERSION=X.Y` in the environment, or `ZBX_VERSION=` in an env file (priority: flag > environment > env file > question). The DB server writes its choice into `zabbix-handoff.txt`, so the app server uses the same version, and it warns if you override it. The script derives the repository URL, the schema path (`dpkg -L`), the PHP-FPM unit and the Apache config from that choice. It never upgrades or downgrades an installed Zabbix of another version: it stops and says to use a fresh VM.
+
 | Scenario | Command |
 |---|---|
 | One VM (Zabbix + MySQL together) | `sudo ./zabbix-setup.sh --mode single` |
@@ -347,7 +354,7 @@ Check **Monitoring → Latest data** filtered to `<WIN_HOSTNAME>` — CPU, memor
   ```text
   ( 7/19) [✓] 1.4 Create the database and user (CREATE USER before GRANT - MySQL 8) (0s)
   ( 8/19) [✓] 1.5 Verify the zabbix user can log in (local socket) (0s)
-  ( 9/19) [✗] 2.1 Add the Zabbix 8.0 repository (Ubuntu 26.04)... ⠸
+  ( 9/19) [✗] 2.1 Add the Zabbix 7.4 repository (Ubuntu 26.04)... ⠸
   ```
 
   - **Full output:** the commands' output (apt, mysql, systemctl…) goes to `/var/log/zabbix-setup.log`, never with the password. A failed step stays red, with its last 15 lines, the error, the fix from the Troubleshooting table above, and the log path.
